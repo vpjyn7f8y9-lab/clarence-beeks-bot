@@ -1,0 +1,2219 @@
+import discord
+import os
+import asyncio
+from dotenv import load_dotenv
+from discord.ext import commands, tasks
+from discord.commands import Option
+import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import io
+import datetime
+from datetime import timedelta
+from zoneinfo import ZoneInfo
+import random
+import yfinance as yf
+import sqlite3
+import json
+import time
+import scipy.stats as si
+
+load_dotenv()
+
+try:                                # <---
+    asyncio.get_event_loop()        # <---
+except RuntimeError:                # <---
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
+# --- CONFIGURATION ---
+guilds_env = os.getenv("GUILD_IDS", "")
+guild_ids = [int(g.strip()) for g in guilds_env.split(",") if g.strip()] if guilds_env else None
+
+CONFIG = {
+    "DISCORD_TOKEN": os.getenv("DISCORD_TOKEN"),
+    "GUILD_IDS": guild_ids,
+    "PROJECT_ID": os.getenv("PROJECT_ID")
+}
+
+# --- BEEKS QUOTES ---
+MOVIE_QUOTES = [
+    "Hey. Back off! I'll rip out your eyes and piss on your brain.",
+    "That's happy. In this country we say Happy New Year.",
+    "This is as far as we go. No more cockamamie cigar smoke. No more Swedish meatballs there, tootsie. And no more phony Irish whiskey. No more goddamn jerky beef! The party's over.",
+    "Alright, on your feet. Up! Let's go. Bunch of fucking weirdos! We're going to take a little walk. And don't try anything funny or the whore loses a kidney. Let's go!",
+    "Operation Strange Brew proceeding according to plan. I anticipate penetration and acquisition at 2100 hours tomorrow.",
+    "How'd you like to make a fast hundred?",
+    "Fuck off.",
+    "Money isn't everything, Mortimer. But having it is.",
+    "When I was a kid, if we wanted a jacuzzi, we had to fart in the tub.",
+    "May I suggest using your night stick officer?",
+    "That's called the 'quart of blood' technique. You do that, a quart of blood will drop out of a person's body.",
+    "Those men wanted to have sex with me!",
+    "I had the most absurd nightmare. I was poor and no one liked me. I lost my job, I lost my house, Penelope hated me and it was all because of this terrible, awful Negro.",
+    "He was wearing my Harvard tie. Can you believe it? MY Harvard tie. Like oh, sure, HE went to Harvard.",
+    "And she stepped on the ball.",
+    "It ain't cool being no jive turkey so close to Thanksgiving.",
+    "Yeah!",
+    "Winthorpe, my boy, what have you got for us?",
+    "Cause I'm a karate man, see! And a karate man bruises on the inside! They don't show their weakness. But you don't know that because you're a big Barry White looking motherfucker! So get outta my face!",
+    "Why don't you retire, sir? You've got a big day ahead of you tomorrow.",
+    "You want me to break something else?",
+    "That was a cheap vase, right? That was a fake? Right?",
+    "Sounds to me like you guys a couple of bookies!",
+    "Man, that watch is so hot, it's smokin'.",
+    "This is a Rouchefoucauld. The thinnest water-resistant watch in the world. Singularly unique, sculptured in design, hand-crafted in Switzerland, and water resistant to three atmospheres. This is the sports watch of the '80s.",
+    "Look, it tells time simultaneously in Monte Carlo, Beverly Hills, London, Paris, Rome, and Gstaad.",
+    "In Philadelphia, it's worth 50 bucks.",
+    "How much for the gun?",
+    "Exactly why do you think the price of pork bellies is going to keep going down, William?",
+    "It … was … the … Dukes! It … was … the … Dukes!",
+    "Yeah. You know, it occurs to me that the best way you hurt rich people is by turning them into poor people.",
+    "Merry New Year!",
+    "Boo bwele boo bwele boo bwele ah ha! Boo bwele boo bwele boo bwele ah ha!",
+    "Something's wrong! Where's Wilson?"
+]
+
+# --- DATABASE ENGINE ---
+def init_db():
+    conn = sqlite3.connect("beeks.db")
+    c = conn.cursor()
+    
+    # Market Data Cache
+    c.execute('''CREATE TABLE IF NOT EXISTS market_data
+                 (ticker TEXT PRIMARY KEY, data_json TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    
+    # Snapshots
+    c.execute('''CREATE TABLE IF NOT EXISTS chain_snapshots
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, 
+                  ticker TEXT, 
+                  tag TEXT,
+                  anchor_price REAL,
+                  dividend_yield REAL,
+                  timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, 
+                  data_json TEXT)''')
+
+    # ROBUST SETTINGS (Key-Value Store)
+    c.execute('''CREATE TABLE IF NOT EXISTS user_settings 
+                 (user_id INTEGER, 
+                  setting_key TEXT, 
+                  setting_value TEXT, 
+                  PRIMARY KEY (user_id, setting_key))''')
+
+    conn.commit()
+    conn.close()
+    print("DEBUG: Database initialized (beeks.db).")
+
+def save_to_db(ticker, data_dict):
+    try:
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        json_str = json.dumps(data_dict, default=str)
+        c.execute('INSERT OR REPLACE INTO market_data (ticker, data_json, timestamp) VALUES (?, ?, CURRENT_TIMESTAMP)', (ticker, json_str))
+        conn.commit()
+        conn.close()
+        print(f"DEBUG: 💾 Saved {ticker} to beeks.db (market_data)")
+    except Exception as e:
+        print(f"ERROR: Could not save to DB: {e}")
+
+def load_from_db(ticker):
+    try:
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        c.execute('SELECT data_json, timestamp FROM market_data WHERE ticker = ?', (ticker,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            data = json.loads(row[0])
+            data['saved_at'] = row[1]
+            print(f"DEBUG: 📂 Loaded {ticker} from beeks.db (Cache) [Time: {row[1]}]")
+            return data
+    except Exception as e:
+        print(f"ERROR: Could not load from DB: {e}")
+    return None
+
+def save_snapshot(ticker, full_chain_data, price, div_yield, tag="MANUAL", custom_timestamp=None):
+    try:
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        
+        full_chain_data['anchor_price'] = price
+        full_chain_data['dividend_yield'] = div_yield
+        json_str = json.dumps(full_chain_data, default=str)
+        
+        if not custom_timestamp:
+            now_ny = datetime.datetime.now(ZoneInfo("America/New_York"))
+            custom_timestamp = now_ny.strftime("%Y-%m-%d %H:%M:%S")
+        
+        # LOGIC CHANGE: Check for existing file first.
+        # If it exists, we ABORT. No overwriting allowed.
+        date_part = custom_timestamp.split(" ")[0]
+        c.execute("SELECT id FROM chain_snapshots WHERE ticker = ? AND tag = ? AND date(timestamp) = ?", 
+                  (ticker, tag, date_part))
+        
+        if c.fetchone():
+            conn.close()
+            print(f"DEBUG: 🛑 Save Rejected. {ticker} [{tag}] already exists for {date_part}.")
+            return False
+
+        c.execute('INSERT INTO chain_snapshots (ticker, tag, anchor_price, dividend_yield, data_json, timestamp) VALUES (?, ?, ?, ?, ?, ?)', 
+                  (ticker, tag, price, div_yield, json_str, custom_timestamp))
+        conn.commit()
+        conn.close()
+        print(f"DEBUG: 📸 Snapshot saved for {ticker} [Price: {price}] [Yield: {div_yield:.2%}] [Tag: {tag}]")
+        return True
+        
+    except Exception as e:
+        print(f"ERROR: Could not save snapshot: {e}")
+        return False
+
+def load_snapshot(ticker):
+    try:
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        query = "SELECT data_json, timestamp, anchor_price, dividend_yield FROM chain_snapshots WHERE ticker = ? ORDER BY id DESC LIMIT 1"
+        c.execute(query, (ticker,))
+        row = c.fetchone()
+        conn.close()
+        
+        if row:
+            data = json.loads(row[0])
+            data['saved_at'] = row[1]
+            if row[2]: data['anchor_price'] = row[2]
+            data['dividend_yield'] = row[3] if row[3] is not None else data.get('dividend_yield', 0.0)
+            
+            print(f"DEBUG: 📂 Loaded Snapshot for {ticker} [Yield: {data['dividend_yield']:.2%}]")
+            return data
+    except Exception as e:
+        print(f"ERROR: Could not load snapshot: {e}")
+    return None
+
+def get_latest_tag_for_date(ticker, date_str):
+    try:
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        query = "SELECT tag FROM chain_snapshots WHERE ticker = ? AND date(timestamp) = ? ORDER BY id DESC LIMIT 1"
+        c.execute(query, (ticker, date_str))
+        row = c.fetchone()
+        conn.close()
+        if row: return row[0]
+    except: pass
+    return "CLOSE"
+
+# --- SIMPLIFIED GLOBAL SETTINGS HELPERS (TERMINAL_TYPE) ---
+def get_user_terminal_setting(user_id):
+    """
+    Retrieves the global terminal_type setting.
+    Logic: Check Global Default -> Default to 'bloomberg'.
+    """
+    conn = sqlite3.connect("beeks.db")
+    c = conn.cursor()
+    
+    # Check Global Setting ('terminal_global')
+    c.execute('SELECT setting_value FROM user_settings WHERE user_id = ? AND setting_key = ?', (user_id, "terminal_global"))
+    row = c.fetchone()
+    conn.close()
+    
+    # Default to 'bloomberg' if no global setting is found (as requested)
+    return row[0] if row else 'bloomberg'
+
+def set_user_terminal_setting(user_id, value):
+    """Saves the global terminal setting to the Key-Value store."""
+    conn = sqlite3.connect("beeks.db")
+    c = conn.cursor()
+    c.execute('INSERT OR REPLACE INTO user_settings (user_id, setting_key, setting_value) VALUES (?, ?, ?)', 
+              (user_id, "terminal_global", value))
+    conn.commit()
+    conn.close()
+
+def validate_atm_data(tkr, current_price):
+    try:
+        exps = tkr.options
+        if not exps: return False
+        chain = tkr.option_chain(exps[0])
+        df = pd.concat([chain.calls, chain.puts])
+        if df.empty: return False
+        df['distance'] = abs(df['strike'] - current_price)
+        atm_opts = df.sort_values('distance').head(4)
+        if len(atm_opts) < 4: return False
+        valid_count = len(atm_opts[atm_opts['impliedVolatility'] > 0.001])
+        return valid_count >= 3
+    except Exception as e:
+        print(f"DEBUG: Validation failed: {e}")
+        return False
+
+def get_current_yield(ticker):
+    try:
+        if ticker in ["^GSPC", "^SPX"]: sym = "SPY"
+        elif ticker in ["^NDX"]: sym = "QQQ"
+        else: sym = ticker
+        tkr = yf.Ticker(sym)
+        y = tkr.info.get('trailingAnnualDividendYield')
+        if y is None: y = tkr.info.get('dividendYield')
+        return y if y else 0.0
+    except:
+        return 0.0
+
+# --- MATH ENGINE (VECTORIZED) ---
+def fetch_market_data(ticker):
+    yf_sym = resolve_yf_symbol(ticker)
+    today = datetime.date.today()
+    today_str = today.strftime("%Y-%m-%d")
+    
+    print(f"\n--- DEBUG: Fetching Data for {ticker} ({yf_sym}) ---")
+
+    try:
+        tkr = yf.Ticker(yf_sym)
+        hist = tkr.history(period="3mo") 
+        if hist.empty: 
+            print("ERROR: No history found.")
+            return None 
+        
+        last_row = hist.iloc[-1]
+        last_date = last_row.name.date()
+        
+        is_market_open = (last_date == today)
+        anchor_price = last_row['Open'] if is_market_open else last_row['Close']
+        mode = "OPEN" if is_market_open else "CLOSE"
+        
+        print(f"DEBUG: Pivot Mode: {mode} | Price: {anchor_price:.2f}")
+
+        returns = np.log(hist['Close'] / hist['Close'].shift(1)).dropna()
+        if len(returns) > 30: returns = returns.tail(30)
+        
+        daily_std = returns.std()
+        hv_annual = daily_std * np.sqrt(252)
+        
+        if np.isnan(hv_annual) or hv_annual == 0: 
+            print("DEBUG: ⚠️ HV failed (NaN or 0). Aborting.")
+            return None 
+        
+        print(f"DEBUG: Annual HV: {hv_annual:.2%}")
+
+        iv_annual = hv_annual 
+        try:
+            search_tkr = tkr
+            if yf_sym == "^GSPC":
+                try:
+                    spx_test = yf.Ticker("^SPX")
+                    if spx_test.options: search_tkr = spx_test
+                except: pass
+
+            try: opts_check = search_tkr.options
+            except: opts_check = []
+            if not opts_check and yf_sym in IV_PROXIES:
+                search_tkr = yf.Ticker(IV_PROXIES[yf_sym])
+
+            # --- STRICT VALIDATION KILL SWITCH ---
+            if not validate_atm_data(search_tkr, anchor_price):
+                print(f"DEBUG: 🛑 ATM Data Invalid for {yf_sym}. STRICT FAIL ENFORCED.")
+                return None # <--- Stops here. No chart will be made.
+            # -------------------------------------
+
+            all_exps = search_tkr.options
+            valid_exps = [e for e in all_exps if (datetime.datetime.strptime(e, "%Y-%m-%d").date() - today).days >= 30]
+            
+            target_exp = None
+            for exp in valid_exps:
+                if is_third_friday(exp):
+                    target_exp = exp
+                    break
+            if not target_exp and valid_exps: target_exp = valid_exps[0]
+            
+            if target_exp:
+                chain = search_tkr.option_chain(target_exp)
+                calls = chain.calls.copy(); calls['type'] = 'C'
+                puts = chain.puts.copy(); puts['type'] = 'P'
+                calls['abs_diff'] = abs(calls['strike'] - anchor_price)
+                puts['abs_diff'] = abs(puts['strike'] - anchor_price)
+                all_opts = pd.concat([calls, puts]).sort_values('abs_diff')
+                valid_opts = all_opts[all_opts['impliedVolatility'] > 0].head(4)
+                
+                if not valid_opts.empty:
+                    avg_iv = valid_opts['impliedVolatility'].mean()
+                    if 0.01 < avg_iv < 5.0:
+                        iv_annual = avg_iv
+        except Exception as e: 
+            print(f"DEBUG: Options fetch error: {e}")
+            return None # Fail on error too
+
+        packet = {
+            "date": today_str,
+            "ticker": yf_sym,
+            "anchor_price": anchor_price,
+            "iv": iv_annual,
+            "hv": hv_annual
+        }
+        
+        save_to_db(yf_sym, packet)
+        return packet
+        
+    except Exception as e: 
+        print(f"ERROR: Fetch failed ({e}). Checking Database...")
+        cached_packet = load_from_db(yf_sym)
+        if cached_packet: return cached_packet
+        return None
+
+def fetch_historical_data(ticker, date_str, tag):
+    db_ticker = get_options_ticker(ticker)
+    print(f"--- DEBUG: Time Travel to {date_str} [{tag}] Ticker: {db_ticker} ---")
+    try:
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        query = '''SELECT data_json FROM chain_snapshots 
+                   WHERE ticker = ? AND date(timestamp) = ? AND tag = ? 
+                   ORDER BY id DESC LIMIT 1'''
+        c.execute(query, (db_ticker, date_str, tag))
+        row = c.fetchone()
+        conn.close()
+        
+        if not row: return None
+        
+        snapshot = json.loads(row[0])
+        anchor_price = snapshot.get('anchor_price')
+        
+        if not anchor_price:
+            print("ERROR: Snapshot exists but missing Anchor Price (Old Data).")
+            return None
+
+        target_exp = None
+        snap_date = datetime.datetime.fromisoformat(snapshot['timestamp']).date()
+        valid_exps = []
+        for exp_str in snapshot['expirations']:
+            d = datetime.datetime.strptime(exp_str, "%Y-%m-%d").date()
+            if (d - snap_date).days >= 30:
+                valid_exps.append(exp_str)
+        
+        valid_exps.sort()
+        if valid_exps: target_exp = valid_exps[0]
+        
+        iv_annual = 0.15 
+        
+        if target_exp:
+            exp_data = snapshot['expirations'][target_exp]
+            calls = pd.DataFrame(exp_data['calls'])
+            puts = pd.DataFrame(exp_data['puts'])
+            calls['abs_diff'] = abs(calls['strike'] - anchor_price)
+            puts['abs_diff'] = abs(puts['strike'] - anchor_price)
+            all_opts = pd.concat([calls, puts]).sort_values('abs_diff')
+            valid_opts = all_opts[all_opts['impliedVolatility'] > 0].head(4)
+            if not valid_opts.empty:
+                iv_annual = valid_opts['impliedVolatility'].mean()
+
+        hv_annual = 0.15
+        try:
+            tkr = yf.Ticker(ticker) 
+            hist = tkr.history(start=snap_date - timedelta(days=60), end=snap_date)
+            returns = np.log(hist['Close'] / hist['Close'].shift(1)).dropna().tail(30)
+            hv_annual = returns.std() * np.sqrt(252)
+        except: pass
+
+        return {
+            "date": date_str,
+            "ticker": ticker,
+            "anchor_price": anchor_price,
+            "iv": iv_annual,
+            "hv": hv_annual,
+            "saved_at": snapshot['timestamp'],
+            "is_backtest": True
+        }
+    except Exception as e:
+        print(f"ERROR: Time Travel Failed: {e}")
+        return None
+
+def fetch_and_enrich_chain(ticker, expiry_date, snapshot_date=None, snapshot_tag=None, target_strike=None, range_count=None, pivot=None, scope="Front Month"):
+    yf_sym = resolve_yf_symbol(ticker)
+    display_ticker = get_options_ticker(yf_sym)
+    
+    S = 0.0; q = 0.0; T = 0.0; r = 0.045
+    chain_data = {'calls': [], 'puts': []}
+    
+    # --- SNAPSHOT / REPLAY LOGIC (Skip Validation, Trust the DB) ---
+    if snapshot_date:
+        tag = snapshot_tag if snapshot_tag else "CLOSE"
+        try:
+            conn = sqlite3.connect("beeks.db")
+            c = conn.cursor()
+            c.execute("SELECT data_json, timestamp, anchor_price, dividend_yield FROM chain_snapshots WHERE ticker = ? AND date(timestamp) = ? AND tag = ? ORDER BY id DESC LIMIT 1", 
+                      (display_ticker, snapshot_date, tag))
+            row = c.fetchone()
+            conn.close()
+            
+            if not row: return None
+            data = json.loads(row[0])
+            
+            try: snap_ts = datetime.datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S")
+            except: snap_ts = datetime.datetime.fromisoformat(row[1])
+            
+            S = row[2] if row[2] else data.get('anchor_price', 0)
+            q = row[3] if row[3] is not None else data.get('dividend_yield', 0.0)
+            
+            target_exps = []
+            
+            if scope == "0DTE":
+                if expiry_date and expiry_date in data['expirations']:
+                    target_exps = [expiry_date]
+                else:
+                    snap_date_str = snap_ts.strftime("%Y-%m-%d")
+                    if snap_date_str in data['expirations']: target_exps = [snap_date_str]
+                    else: return None
+
+            elif scope == "Front Month":
+                target_exps = [e for e in data['expirations'] if 0 <= (datetime.datetime.strptime(e, "%Y-%m-%d") - snap_ts).days <= 30]
+            
+            elif scope == "Total Market":
+                target_exps = list(data['expirations'].keys())
+            
+            else:
+                if expiry_date in data['expirations']: target_exps = [expiry_date]
+            
+            for e in target_exps:
+                exp_dt = datetime.datetime.strptime(e, "%Y-%m-%d")
+                t_val = (exp_dt - snap_ts).days / 365.0
+                if t_val < 0.001: t_val = 0.001 
+                
+                c_list = data['expirations'][e]['calls']
+                p_list = data['expirations'][e]['puts']
+                for x in c_list: x['time_year'] = t_val
+                for x in p_list: x['time_year'] = t_val
+                
+                chain_data['calls'].extend(c_list)
+                chain_data['puts'].extend(p_list)
+
+        except: return None
+        
+    # --- LIVE DATA LOGIC (STRICT VALIDATION ADDED) ---
+    else:
+        try:
+            tkr = yf.Ticker(yf_sym)
+            hist = tkr.history(period="1d")
+            if hist.empty: return None
+            S = hist['Close'].iloc[-1]
+            q = get_current_yield(yf_sym)
+            
+            # --- NEW: VALIDATION CHECK ---
+            # If the data is garbage (zeros), we STOP right here.
+            if not validate_atm_data(tkr, S):
+                print(f"DEBUG: Validation Failed for {yf_sym} (Live). Aborting.")
+                return None 
+            # -----------------------------
+            
+            search_tkr = tkr
+            if yf_sym == "^GSPC":
+                 try: 
+                     spx = yf.Ticker("^SPX")
+                     if spx.options: search_tkr = spx
+                 except: pass
+
+            all_exps = search_tkr.options
+            if not all_exps: return None
+            
+            target_exps = []
+            now = datetime.datetime.now()
+            
+            if scope == "0DTE":
+                today_str = now.strftime("%Y-%m-%d")
+                if today_str in all_exps: target_exps = [today_str]
+                else: return [] 
+                
+            elif scope == "Total Market":
+                target_exps = all_exps 
+                
+            elif scope == "Front Month":
+                target_exps = [e for e in all_exps if 0 <= (datetime.datetime.strptime(e, "%Y-%m-%d") - now).days <= 35]
+            
+            else:
+                if expiry_date in all_exps: target_exps = [expiry_date]
+
+            raw_chain = {"expirations": {}, "symbol": yf_sym, "timestamp": now.strftime("%Y-%m-%d %H:%M:%S")}
+            
+            for e in target_exps:
+                try:
+                    opt = search_tkr.option_chain(e)
+                    c_list = opt.calls.to_dict(orient='records')
+                    p_list = opt.puts.to_dict(orient='records')
+                    
+                    raw_chain["expirations"][e] = {"calls": c_list, "puts": p_list}
+                    
+                    exp_dt = datetime.datetime.strptime(e, "%Y-%m-%d")
+                    t_val = (exp_dt - now).days / 365.0
+                    if t_val < 0.001: t_val = 0.001
+                    
+                    for x in c_list: x['time_year'] = t_val
+                    for x in p_list: x['time_year'] = t_val
+                    
+                    chain_data['calls'].extend(c_list)
+                    chain_data['puts'].extend(p_list)
+                except: pass
+            
+            if scope == "Total Market" and len(target_exps) > 5:
+                ny_time = datetime.datetime.now(ZoneInfo("America/New_York"))
+                user_tag = f"USER_{ny_time.strftime('%H%M')}"
+                save_snapshot(display_ticker, raw_chain, S, q, tag=user_tag)
+
+        except Exception as e: 
+            print(f"Fetch Error: {e}")
+            return None
+
+    all_options = []
+    for c in chain_data['calls']:
+        c['type'] = 'Call'; all_options.append(c)
+    for p in chain_data['puts']:
+        p['type'] = 'Put'; all_options.append(p)
+    
+    df = pd.DataFrame(all_options)
+    if df.empty: return []
+    
+    df.rename(columns={
+        'impliedVolatility': 'iv', 
+        'openInterest': 'oi', 
+        'volume': 'vol', 
+        'lastPrice': 'price'
+    }, inplace=True, errors='ignore')
+
+    if target_strike:
+        df = df[df['strike'] == target_strike]
+    elif range_count:
+        anchor = pivot if pivot else S
+        unique_strikes = df['strike'].unique()
+        dists = pd.DataFrame({'strike': unique_strikes, 'dist': abs(unique_strikes - anchor)})
+        keep_strikes = dists.sort_values('dist').head(range_count)['strike'].values
+        df = df[df['strike'].isin(keep_strikes)]
+
+    results = []
+    
+    if range_count is not None:
+         # Standard Chain Command / Exposure Processing
+         for _, row in df.iterrows():
+            K = row['strike']
+            IV = row['iv']
+            if not IV or IV < 0.001: continue
+            
+            # Unpack 5 values
+            delta, gamma, theta, vanna, charm = calculate_black_scholes(S, K, row['time_year'], r, IV, q, row['type'].lower())
+            
+            item = {
+                'strike': K, 'type': row['type'], 'price': row.get('price', 0),
+                'bid': row.get('bid', 0), 'ask': row.get('ask', 0),
+                'volume': row.get('vol', 0), 'oi': row.get('oi', 0),
+                'iv': IV, 
+                'delta': delta, 'gamma': gamma, 'theta': theta, 
+                'vanna': vanna, 'charm': charm, 
+                'spot': S
+            }
+            results.append(item)
+         return sorted(results, key=lambda x: x['strike'])
+    else:
+        return df.to_dict(orient='records')
+
+def calculate_levels(price, iv, hv, engine="Insider Info"):
+    # LOGIC FIX: Check lower case to be safe against CAPS/formatting changes
+    # "Insider Info" = 365 days (Crypto/Continuous style)
+    # "Market Floor" = 252 days (Standard Trading Days)
+    
+    is_insider = engine.strip().lower() == "insider info"
+    divisor = np.sqrt(365) if is_insider else np.sqrt(252)
+    
+    move_iv = price * (iv / divisor)
+    move_hv = price * (hv / divisor)
+    
+    levels = {
+        "meta": {"engine": engine, "daily_move_iv": move_iv, "daily_move_hv": move_hv},
+        "valentine": {},
+        "winthorpe": {}
+    }
+    
+    for i in range(1, 5):
+        levels["valentine"][f"+{i}σ"] = price + (move_iv * i)
+        levels["valentine"][f"-{i}σ"] = price - (move_iv * i)
+        levels["winthorpe"][f"+{i}σ"] = price + (move_hv * i)
+        levels["winthorpe"][f"-{i}σ"] = price - (move_hv * i)
+        
+    return levels
+
+def calculate_atm_strike(price):
+    """Rounds the spot price to the nearest 5-point strike increment."""
+    return round(price / 5) * 5
+
+def calculate_black_scholes(S, K, T, r, sigma, q=0.0, option_type="call"):
+    """
+    Vectorized Black-Scholes Calculator (Enhanced: Returns 5 Values).
+    Returns RAW (Unscaled) Greeks: Delta, Gamma, Theta, Vanna, Charm.
+    """
+    try:
+        S = np.array(S, dtype=float)
+        K = np.array(K, dtype=float)
+        T = np.array(T, dtype=float)
+        sigma = np.array(sigma, dtype=float)
+        
+        T = np.maximum(T, 1e-5)
+        
+        d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        
+        N_d1 = si.norm.cdf(d1)
+        N_d2 = si.norm.cdf(d2)
+        pdf_d1 = si.norm.pdf(d1)
+        
+        # 1. GAMMA (Raw)
+        gamma = (pdf_d1 * np.exp(-q * T)) / (S * sigma * np.sqrt(T))
+        
+        # 2. VANNA (dDelta/dVol) - Scaled for 1% vol change usually, but keeping raw math here
+        # Raw Vanna = -e^-qT * N'(d1) * d2/sigma
+        vanna = -np.exp(-q * T) * pdf_d1 * (d2 / sigma)
+        
+        if option_type == "call":
+            # 3. DELTA
+            delta = np.exp(-q * T) * N_d1
+            
+            # 4. THETA (Daily)
+            theta = (- (S * sigma * np.exp(-q * T) * pdf_d1) / (2 * np.sqrt(T)) 
+                     - r * K * np.exp(-r * T) * N_d2 
+                     + q * S * np.exp(-q * T) * N_d1) / 365.0
+            
+            # 5. CHARM (Delta Decay / dDelta/dTime) - Daily bleed
+            term1 = q * np.exp(-q * T) * N_d1
+            term2 = np.exp(-q * T) * pdf_d1 * (2 * (r - q) * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))
+            charm = (term1 - term2) / 365.0
+            
+        else:
+            delta = np.exp(-q * T) * (N_d1 - 1)
+            
+            theta = (- (S * sigma * np.exp(-q * T) * pdf_d1) / (2 * np.sqrt(T)) 
+                     + r * K * np.exp(-r * T) * (1 - N_d2) 
+                     - q * S * np.exp(-q * T) * (1 - N_d1)) / 365.0
+            
+            term1 = -q * np.exp(-q * T) * (1 - N_d1)
+            term2 = np.exp(-q * T) * pdf_d1 * (2 * (r - q) * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))
+            charm = (term1 - term2) / 365.0
+
+        if np.ndim(delta) == 0:
+            return float(delta), float(gamma), float(theta), float(vanna), float(charm)
+            
+        return delta, gamma, theta, vanna, charm
+    except:
+        return 0.0, 0.0, 0.0, 0.0, 0.0
+
+def calculate_gamma_flip(chain_data, current_spot, r=0.045, q=0.0):
+    """
+    Simulates Spot Price +/- 7% to find the Zero Gamma Level.
+    Returns: flip_price, plot_buffer (if requested)
+    """
+    if not chain_data: return None, None
+    
+    df = pd.DataFrame(chain_data)
+    if df.empty: return None, None
+    
+    df = df[(df['iv'] > 0.001) & (df['oi'] > 0)]
+    if df.empty: return None, None
+    
+    strikes = df['strike'].values
+    ivs = df['iv'].values
+    Ts = df.get('time_year', pd.Series([0.1]*len(df))).values 
+    is_call = (df['type'] == 'Call').values
+    ois = df['oi'].values
+    
+    sim_spots = np.linspace(current_spot * 0.93, current_spot * 1.07, 100)
+    net_gammas = []
+    
+    for sim_S in sim_spots:
+        # Update: Unpack 5 values, ignore theta/vanna/charm for this calc
+        _, gammas, _, _, _ = calculate_black_scholes(sim_S, strikes, Ts, r, ivs, q, "call") 
+        
+        # STANDARD MODEL (GEX): Dealers Long Calls, Short Puts
+        # Note: Gamma is raw here, so we multiply by 100 for contract size
+        call_gex = np.sum(gammas[is_call] * ois[is_call] * 100)
+        put_gex = np.sum(gammas[~is_call] * ois[~is_call] * 100 * -1)
+        
+        net_gammas.append(call_gex + put_gex)
+        
+    net_gammas = np.array(net_gammas)
+    signs = np.sign(net_gammas)
+    diffs = np.diff(signs)
+    cross_indices = np.where(diffs != 0)[0]
+    
+    flip_price = None
+    if len(cross_indices) > 0:
+        idx = cross_indices[np.abs(sim_spots[cross_indices] - current_spot).argmin()]
+        y1, y2 = net_gammas[idx], net_gammas[idx+1]
+        x1, x2 = sim_spots[idx], sim_spots[idx+1]
+        if y2 != y1:
+            flip_price = x1 + (0 - y1) * (x2 - x1) / (y2 - y1)
+            
+    return flip_price, (sim_spots, net_gammas)
+
+def calculate_market_exposures(chain_data, spot_price):
+    """Aggregates Total GEX, DEX, and VEX (Dollar Exposures)."""
+    total_gex = 0.0
+    total_dex = 0.0
+    total_vex = 0.0 
+    
+    for opt in chain_data:
+        # 1. Unpack Raw Greeks
+        delta = opt['delta']
+        gamma = opt['gamma']
+        vanna = opt.get('vanna', 0.0)
+        oi = opt['oi']
+        
+        if pd.isna(oi) or oi <= 0: continue
+        
+        # 2. Determine Dealer Positioning Signs
+        # Calls: Dealer Short (Negative Delta, Long Gamma)
+        # Puts: Dealer Long (Negative Delta, Short Gamma)
+        is_call = opt['type'].lower() == 'call'
+        
+        if is_call:
+            dir_gex = 1.0   # Dealer Long Gamma
+            dir_dex = -1.0  # Dealer Short Delta
+        else:
+            dir_gex = -1.0  # Dealer Short Gamma
+            dir_dex = -1.0  # Dealer Short Delta (Put delta is neg, so neg*neg = pos position? No.)
+            # If Dealer buys Put: They have negative delta. They must BUY stock to hedge.
+            # Put Delta is -0.5. 
+            # Dealer Delta = +1 (Long) * -0.5 = -0.5.
+            # So Dealer Delta is always negative of the option delta direction if they are Short Vol? 
+            # Let's stick to standard GEX convention:
+            # Call OI adds to GEX. Put OI subtracts.
+            
+        # GEX ($ per 1% move)
+        # Formula: Gamma * OI * 100 (contract) * Spot^2 * 0.01 * Direction
+        contract_gex = (gamma * oi * 100) * (spot_price**2) * 0.01
+        if not is_call: contract_gex *= -1 # Puts dampen/negative gamma
+        total_gex += contract_gex
+        
+        # DEX ($ Notional Dealer Exposure)
+        # Net Delta = (Call Delta * OI * 100 * -1) + (Put Delta * OI * 100 * 1)
+        # If Dealer Sold Call (Short): Delta is Negative.
+        # If Dealer Bought Put (Long): Delta is Negative.
+        contract_dex = (delta * oi * 100 * spot_price)
+        # Invert for Dealer (Counterparty)
+        if is_call: contract_dex *= -1 # Sold Call
+        else: contract_dex *= 1 # Bought Put (Long Put has neg delta, so result is neg)
+        
+        total_dex += contract_dex
+
+        # VEX (Dollar Vanna - Exposure to Vol Change)
+        # Vanna is change in Delta per 1% Vol.
+        # Dollar Vanna = Vanna * OI * 100 * Spot * 0.01 (if vanna is raw)
+        # Vanna (raw) is usually small.
+        # We scale by 1% move in IV.
+        contract_vex = (vanna * 0.01) * oi * 100 * spot_price
+        if is_call: contract_vex *= -1 # Dealer Short
+        else: contract_vex *= 1 # Dealer Long
+        total_vex += contract_vex
+
+    return total_gex, total_dex, total_vex
+
+def calculate_strike_exposures(chain_data, spot_price, ticker):
+    """Aggregates Exposure per Strike (GEX, DEX, VEX)."""
+    strikes = {}
+    
+    # 1. Determine Range
+    if ticker in ["^SPX", "^GSPC", "SPX", "ES=F"]:
+        r_pts = 125 
+    elif ticker in ["^NDX", "NDX", "NQ=F"]:
+        r_pts = 250
+    else:
+        r_pts = spot_price * 0.10 
+        
+    min_strike = spot_price - r_pts
+    max_strike = spot_price + r_pts
+    
+    for opt in chain_data:
+        k = opt['strike']
+        if k < min_strike or k > max_strike: continue
+        
+        if k not in strikes: strikes[k] = {'gex': 0.0, 'dex': 0.0, 'vex': 0.0}
+        
+        # Unpack Raw Greeks
+        gamma = opt['gamma'] 
+        delta = opt['delta']
+        vanna = opt.get('vanna', 0.0)
+        oi = opt['oi']
+        if pd.isna(oi) or oi <= 0: continue
+        
+        is_call = opt['type'].lower() == 'call'
+        
+        # Dealer Positioning Logic (Standard: Dealer Short Calls, Long Puts)
+        if is_call:
+            # Dealer Short Call
+            dir_gex = 1.0   # Long Gamma (from short call? Standard GEX convention is Call=Pos)
+            dir_dex = -1.0  # Short Delta
+            dir_vex = -1.0  # Short Vanna
+        else:
+            # Dealer Long Put (Hedge against customer long put)
+            dir_gex = -1.0  # Short Gamma
+            dir_dex = -1.0  # Short Delta (Put delta neg, dealer long put = neg delta) - wait. 
+            # If dealer is long put, delta is negative. 
+            # If dealer sold put, dealer is long delta.
+            # Standard GEX: Put OI subtracts.
+            dir_vex = 1.0   # Long Vanna
+            
+        # 1. GEX ($ per 1% move)
+        g_val = (gamma * oi * 100) * (spot_price**2) * 0.01
+        if not is_call: g_val *= -1
+        strikes[k]['gex'] += g_val
+        
+        # 2. DEX (Net Delta Notional)
+        d_val = (delta * oi * 100 * spot_price)
+        # Invert for Dealer Side
+        if is_call: d_val *= -1 # Dealer sold call -> Short Delta
+        else: d_val *= 1 # Dealer bought put (from customer selling) -> Short Delta
+        # Wait, standard market maker model: Short Calls (-), Short Puts (+)
+        # Let's stick to the "Wall" view:
+        # Call Wall = Resistance (Dealers sell). Put Wall = Support (Dealers buy).
+        strikes[k]['dex'] += d_val
+        
+        # 3. VEX ($ per 1% IV Change)
+        v_val = (vanna * 0.01) * oi * 100 * spot_price
+        if is_call: v_val *= -1
+        else: v_val *= 1
+        strikes[k]['vex'] += v_val
+        
+    sorted_strikes = sorted(strikes.keys())
+    data = {
+        'strikes': sorted_strikes,
+        'gex': [strikes[k]['gex'] for k in sorted_strikes],
+        'dex': [strikes[k]['dex'] for k in sorted_strikes],
+        'vex': [strikes[k]['vex'] for k in sorted_strikes]
+    }
+    return data
+
+# --- PLOTTING ---
+def create_beeks_chart(display_ticker, data, levels, view_mode="Insider Info"):
+    # 1. Setup Figure
+    # We turn OFF constrained_layout so we can manually stretch it
+    fig = plt.figure(figsize=(12, 8)) 
+    plt.style.use('dark_background')
+    
+    # 2. MANUALLY STRETCH TO EDGES (The "Full Canvas" Fix)
+    # This forces the axes to take up 96% of the width and 86% of the height
+    plt.subplots_adjust(left=0.02, right=0.98, top=0.88, bottom=0.02)
+    
+    price = data['anchor_price']
+    ax = plt.gca()
+    trans = ax.get_yaxis_transform()
+    
+    # 3. Plot Lines
+    all_values = [price]
+    
+    # Winthorpe (HV)
+    for label, val in levels['winthorpe'].items():
+        all_values.append(val)
+        plt.axhline(val, color='orange', linestyle=':', alpha=0.7, linewidth=1.5)
+        plt.text(0.01, val, f"{label}: {val:.2f}", color='orange', fontsize=9, va='bottom', fontweight='bold', transform=trans)
+    
+    # Valentine (IV)
+    for label, val in levels['valentine'].items():
+        all_values.append(val)
+        plt.axhline(val, color='cyan', linestyle='-', alpha=0.7, linewidth=1.5)
+        plt.text(0.99, val, f"{label}: {val:.2f}", color='cyan', fontsize=9, va='bottom', ha='right', fontweight='bold', transform=trans)
+        
+    # Pivot
+    plt.axhline(price, color='white', linewidth=2, linestyle='--')
+    plt.text(0.5, price, f"PIVOT: {price:.2f}", color='white', fontsize=10, fontweight='bold', va='bottom', ha='center', transform=trans)
+    
+    # 4. FORCE ZOOM (Software Fix)
+    y_min = min(all_values)
+    y_max = max(all_values)
+    diff = y_max - y_min
+    if diff < 1.0: diff = price * 0.01 
+    buffer = diff * 0.10
+    plt.ylim(y_min - buffer, y_max + buffer)
+    
+    # 5. Styling
+    plt.title(f"Clarence Beeks Report: {display_ticker}\nEngine: {view_mode}", color='white', fontsize=14, weight='bold')
+    plt.grid(False)
+    
+    # Ticks
+    ax.tick_params(axis='y', colors='white', labelsize=10)
+    ax.tick_params(axis='x', colors='white', bottom=False, labelbottom=False) 
+    
+    # Legend
+    from matplotlib.lines import Line2D
+    custom_lines = [Line2D([0], [0], color='cyan', lw=2), Line2D([0], [0], color='orange', lw=2, linestyle=':')]
+    plt.legend(custom_lines, ['VALENTINE', 'WINTHORPE'], loc='upper left', facecolor='black', labelcolor='white', framealpha=0.6)
+    
+    # 6. Save
+    buf = io.BytesIO()
+    # facecolor='black' ensures that IF there is any tiny pixel gap at the edge, it matches the chart
+    fig.savefig(buf, format='png', facecolor='black', dpi=120)
+    buf.seek(0); plt.close()
+    return buf
+
+def generate_exposure_dashboard(ticker, spot, gex, dex, vex, scope_label, expiry_label):
+    """Generates a Modern Dark Mode Bar Chart for Exposures."""
+    plt.figure(figsize=(10, 6))
+    plt.style.use('dark_background')
+    
+    # Data
+    metrics = ['VANNA (VEX)', 'DELTA (DEX)', 'GAMMA (GEX)']
+    # Normalize for visualization? No, magnitudes are vastly different.
+    # We will plot them on their own scales or just simple bars normalized to "Sentiment"
+    # Actually, calculating simple relative strength for visual bars is hard because DEX is usually huge.
+    # Let's just do a visual dashboard with Text and "Thermometers"
+    
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.axis('off')
+    
+    # Background color
+    fig.patch.set_facecolor('#1e1e1e')
+    
+    # Helper to format
+    def fmt_val(val, is_vanna=False):
+        d = 1_000_000 if is_vanna else 1_000_000_000
+        suffix = "M" if is_vanna else "B"
+        return f"${val/d:+.2f} {suffix}"
+
+    # Colors
+    c_gex = '#00ff00' if gex > 0 else '#ff0000'
+    c_dex = '#00ffff' if dex > 0 else '#ff00ff'
+    c_vex = '#ffff00' if vex > 0 else '#ff8800'
+    
+    # Draw "Cards"
+    # GEX
+    plt.text(0.15, 0.7, "GAMMA EXPOSURE (GEX)", color='white', fontsize=12, ha='center', weight='bold')
+    plt.text(0.15, 0.5, fmt_val(gex), color=c_gex, fontsize=24, ha='center', weight='bold')
+    plt.text(0.15, 0.4, "per 1% Move", color='#888888', fontsize=10, ha='center')
+
+    # DEX
+    plt.text(0.5, 0.7, "DELTA EXPOSURE (DEX)", color='white', fontsize=12, ha='center', weight='bold')
+    plt.text(0.5, 0.5, fmt_val(dex), color=c_dex, fontsize=24, ha='center', weight='bold')
+    plt.text(0.5, 0.4, "Net Notional", color='#888888', fontsize=10, ha='center')
+
+    # VEX
+    plt.text(0.85, 0.7, "VANNA EXPOSURE (VEX)", color='white', fontsize=12, ha='center', weight='bold')
+    plt.text(0.85, 0.5, fmt_val(vex, True), color=c_vex, fontsize=24, ha='center', weight='bold')
+    plt.text(0.85, 0.4, "per 1% IV Chg", color='#888888', fontsize=10, ha='center')
+    
+    # Visual Separators
+    plt.vlines(x=[0.33, 0.66], ymin=0.3, ymax=0.8, colors='#333333', linewidth=2)
+    plt.hlines(y=0.25, xmin=0.05, xmax=0.95, colors='#333333', linewidth=2)
+    
+    # Footer Info
+    info_text = f"{ticker} @ {spot:.2f}  |  {scope_label}"
+    if expiry_label: info_text += f"  |  EXP: {expiry_label}"
+    
+    plt.text(0.5, 0.1, info_text, color='white', fontsize=11, ha='center', style='italic')
+    
+    # Sentiment
+    sentiment = "DAMPENED VOLATILITY" if gex > 0 else "ACCELERATED VOLATILITY"
+    s_color = '#00ff00' if gex > 0 else '#ff0000'
+    plt.text(0.5, 0.85, f"REGIME: {sentiment}", color=s_color, fontsize=14, ha='center', weight='bold', bbox=dict(facecolor='#111111', edgecolor=s_color, pad=10))
+
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e')
+    buf.seek(0); plt.close()
+    return buf
+
+def generate_strike_chart(ticker, spot, data, metric="ALL", confluence_data=None):
+    """Generates Exposure Charts (Confluence = Horizontal Profile, Others = Vertical)."""
+    plt.style.use('dark_background')
+    
+    # --- SPECIAL MODE: CONFLUENCE PROFILE (Horizontal) ---
+    if metric == "CONFLUENCE":
+        if not confluence_data: return None
+        
+        # Filter active levels
+        active_levels = [x for x in confluence_data if x['score'] > 0]
+        if not active_levels: return None
+        
+        # Sort by Strike (Descending) so high prices are at top of Y-axis
+        active_levels.sort(key=lambda x: x['strike'])
+        
+        c_strikes = [x['strike'] for x in active_levels]
+        c_scores = [x['score'] for x in active_levels]
+        c_tags = [x['tags'] for x in active_levels]
+        
+        fig, ax = plt.subplots(figsize=(10, 8))
+        fig.patch.set_facecolor('#1e1e1e')
+        ax.set_facecolor('#1e1e1e')
+        
+        # Dynamic Colors (Gold=3, Cyan=2, Gray=1)
+        colors = []
+        for s in c_scores:
+            if s >= 3: colors.append('#FFD700')
+            elif s == 2: colors.append('#00FFFF')
+            else: colors.append('#555555')
+            
+        # Plot Horizontal Bars
+        bars = ax.barh(c_strikes, c_scores, color=colors, height=(c_strikes[1]-c_strikes[0])*0.8 if len(c_strikes)>1 else 2, alpha=0.8)
+        
+        # Spot Line (Horizontal now)
+        ax.axhline(spot, color='white', linestyle='--', linewidth=2, label=f'Spot: {spot:.2f}')
+        
+        # Labels (Drivers) - Placed at the end of the bars
+        for bar, tag, score in zip(bars, c_tags, c_scores):
+            width = bar.get_width()
+            # Place text slightly to the right of the bar
+            ax.text(width + 0.1, bar.get_y() + bar.get_height()/2, 
+                    f" {tag}", va='center', color='white', fontsize=10, fontweight='bold')
+
+        # Axis Formatting
+        ax.set_xlabel("Confluence Score (Overlap)", color='white')
+        ax.set_ylabel("Strike Price", color='white')
+        ax.set_title(f"{ticker} Structural Confluence Profile", color='white', weight='bold', fontsize=14)
+        
+        # Set X-Axis limits (0 to 4 to give room for labels)
+        ax.set_xlim(0, 4.5)
+        ax.set_xticks([0, 1, 2, 3])
+        ax.set_xticklabels(['', '1 (Weak)', '2 (Strong)', '3 (Major)'])
+        
+        # Grid just on X axis
+        ax.grid(True, axis='x', alpha=0.15)
+        
+        # Legend for colors
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#FFD700', label='Triple (G+D+V)'),
+            Patch(facecolor='#00FFFF', label='Double'),
+            Patch(facecolor='#555555', label='Single')
+        ]
+        ax.legend(handles=legend_elements, loc='lower right')
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e')
+        buf.seek(0); plt.close()
+        return buf
+
+    # --- STANDARD MODES (Vertical) ---
+    # (This section handles GEX/DEX/VEX/ALL normally)
+    strikes = np.array(data['strikes'])
+    
+    if metric == "ALL":
+        plot_metrics = ["GEX", "DEX", "VEX"]
+        fig, axes = plt.subplots(3, 1, figsize=(12, 12), sharex=True)
+        plt.subplots_adjust(hspace=0.3)
+    else:
+        plot_metrics = [metric]
+        fig, axes = plt.subplots(1, 1, figsize=(12, 6))
+        axes = [axes] 
+        
+    fig.patch.set_facecolor('#1e1e1e')
+    
+    # Pre-calculate Confluence for highlighting
+    key_strikes = {}
+    if confluence_data:
+        for item in confluence_data:
+            if item['score'] >= 2: key_strikes[item['strike']] = item['score']
+
+    for i, m in enumerate(plot_metrics):
+        ax = axes[i]
+        vals = np.array(data[m.lower()])
+        colors = ['#00ff00' if v >= 0 else '#ff0000' for v in vals]
+        ax.bar(strikes, vals, color=colors, width=(strikes[1]-strikes[0])*0.8 if len(strikes)>1 else 1, alpha=0.8)
+        
+        if key_strikes:
+            for strike_val in key_strikes:
+                ax.axvline(strike_val, color='#FFD700', linestyle=':', alpha=0.4, linewidth=1)
+                if i == 0: ax.text(strike_val, ax.get_ylim()[1]*0.95, "★", color='#FFD700', fontsize=12, ha='center')
+
+        ax.axhline(0, color='white', linewidth=1.5)
+        if len(vals) > 0:
+            max_mag = max(abs(np.min(vals)), abs(np.max(vals)))
+            ax.set_ylim(-max_mag*1.15, max_mag*1.15)
+        
+        ax.axvline(spot, color='white', linestyle='--', linewidth=2, label=f'Spot: {spot:.2f}')
+        ax.set_ylabel(f"Net {m} ($)", color='white', fontsize=12)
+        ax.set_title(f"Net Dealer {m} by Strike", color='white', weight='bold')
+        ax.grid(True, alpha=0.15)
+        ax.set_facecolor('#1e1e1e')
+        
+        def human_format(num, pos):
+            magnitude = 0
+            while abs(num) >= 1000:
+                magnitude += 1
+                num /= 1000.0
+            return '%.1f%s' % (num, ['', 'K', 'M', 'B'][magnitude])
+        ax.yaxis.set_major_formatter(plt.FuncFormatter(human_format))
+
+    plt.xlabel("Strike Price", color='white', fontsize=12)
+    plt.suptitle(f"{ticker} Exposure Profile", color='white', fontsize=16, weight='bold', y=0.95)
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e')
+    buf.seek(0); plt.close()
+    return buf
+
+# --- DISCORD INIT ---
+# Using the env variable list if present, else standard global init
+bot = discord.Bot(debug_guilds=CONFIG["GUILD_IDS"] if CONFIG["GUILD_IDS"] else None)
+
+# --- SYMBOL MAPPINGS ---
+YF_SYMBOLS = {
+    "spx": "^GSPC", "es": "^GSPC",
+    "ndx": "^NDX",  "nq": "^NDX",
+    "rut": "^RUT",  "rty": "^RUT",
+    "ym": "YM=F",   "dow": "YM=F",
+    "vix": "^VIX",  "sp": "^GSPC",
+    "spy": "SPY",   "qqq": "QQQ",
+    "iwm": "IWM",   "dia": "DIA",
+    "vixy": "VIXY", "uvxy": "UVXY",
+    "tlt": "TLT",   "hyg": "HYG"
+}
+
+IV_PROXIES = {
+    "^GSPC": "SPY",
+    "^NDX": "QQQ",
+    "^RUT": "IWM"
+}
+
+def resolve_yf_symbol(user_input: str) -> str:
+    return YF_SYMBOLS.get(user_input.lower(), user_input.upper())
+
+def get_options_ticker(yf_sym):
+    if yf_sym == "^GSPC": return "^SPX"
+    return yf_sym
+
+def is_third_friday(date_str):
+    d = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+    return d.weekday() == 4 and 15 <= d.day <= 21
+
+# --- COMMAND HELPERS (MUST BE BEFORE COMMANDS) ---
+async def get_db_dates(ctx: discord.AutocompleteContext):
+    ticker_input = ctx.options.get("ticker", "^SPX")
+    yf_sym = resolve_yf_symbol(ticker_input)
+    db_ticker = get_options_ticker(yf_sym)
+    conn = sqlite3.connect("beeks.db")
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT date(timestamp) FROM chain_snapshots WHERE ticker = ? ORDER BY timestamp DESC LIMIT 25", (db_ticker,))
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+async def get_db_tags(ctx: discord.AutocompleteContext):
+    # Updated to look for 'replay_date' primarily
+    selected_date = ctx.options.get("replay_date") or ctx.options.get("snapshot_date")
+    
+    if not selected_date:
+        return ["⬅️ Select a DATE first"]
+    
+    ticker_input = ctx.options.get("ticker", "^SPX")
+    yf_sym = resolve_yf_symbol(ticker_input)
+    db_ticker = get_options_ticker(yf_sym)
+    conn = sqlite3.connect("beeks.db")
+    c = conn.cursor()
+    c.execute("SELECT DISTINCT tag FROM chain_snapshots WHERE ticker = ? AND date(timestamp) = ?", (db_ticker, selected_date))
+    rows = c.fetchall()
+    conn.close()
+    tags = [r[0] for r in rows]
+    return tags if tags else ["❌ No sessions found"]
+
+def get_next_market_date(current_dt):
+    """Calculates the next market date (Monday if Sat/Sun)."""
+    current_date = current_dt.date()
+    # Check if we are past market close on Friday (4 PM ET usually)
+    is_after_market_close = current_dt.weekday() == 4 and current_dt.hour >= 16
+
+    if current_date.weekday() >= 5 or is_after_market_close: # Saturday, Sunday, or Friday evening
+        # Calculate days until Monday (0=Mon, 1=Tue, ..., 6=Sun)
+        days_ahead = (7 - current_date.weekday()) % 7
+        if days_ahead == 0: # If run early Monday morning before open
+            days_ahead = 1
+        elif days_ahead > 2: # If run Friday after close (4=Fri)
+            days_ahead = 3 
+            
+        next_market_date = current_date + timedelta(days=days_ahead)
+    else:
+        # Normal market day, next market day is tomorrow
+        next_market_date = current_date + timedelta(days=1)
+        
+    # Check if the calculated next day is a weekend (if calculated using simple +1)
+    if next_market_date.weekday() >= 5: # Saturday or Sunday
+        next_market_date += timedelta(days=(7 - next_market_date.weekday())) # Jump to Monday
+
+    return next_market_date.strftime("%Y-%m-%d")
+
+def delete_snapshot_from_db(ticker, date_str, tag):
+    ticker = get_options_ticker(ticker)
+    deleted_count = 0
+    try:
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        query = "DELETE FROM chain_snapshots WHERE ticker = ? AND date(timestamp) = ? AND tag = ?"
+        c.execute(query, (ticker, date_str, tag))
+        deleted_count = c.rowcount
+        conn.commit()
+        conn.close()
+        print(f"DEBUG: 🗑️ Deleted {deleted_count} records for {ticker} {date_str} [{tag}]")
+    except Exception as e:
+        print(f"ERROR: Could not delete snapshot: {e}")
+    return deleted_count > 0
+
+# --- COMMANDS ---
+beeks = bot.create_group("beeks", "Official Dukes Bros. Fixer")
+
+@beeks.command(name="setmode", description="Configure Global Terminal View Settings")
+async def beeks_setmode(
+    ctx: discord.ApplicationContext,
+    terminal: Option(str, name="terminal", description="Style", choices=["Modern", "Bloomberg"], required=True)
+):
+    set_user_terminal_setting(ctx.author.id, terminal.lower())
+    await ctx.respond(f"🌎 **Global Terminal View** set to: **{terminal.upper()}** for all reports.", ephemeral=True)
+
+@beeks.command(name="snapshot", description="ADMIN: Force Download Full Chain")
+@commands.has_permissions(administrator=True)
+async def beeks_snapshot(
+    ctx: discord.ApplicationContext, 
+    ticker: Option(str, name="ticker", description="Ticker Symbol", required=True),
+    session: Option(str, name="session", description="Label (e.g. FOMC, TEST, MANUAL)", required=True),
+    force_date: Option(str, name="force_date", description="Override Date (YYYY-MM-DD)", required=False)
+):
+    await ctx.defer(ephemeral=True)
+    
+    yf_sym = get_options_ticker(resolve_yf_symbol(ticker))
+    
+    try:
+        tkr = yf.Ticker(yf_sym)
+        hist = tkr.history(period="1d")
+        
+        if hist.empty and not tkr.options:
+             await ctx.respond(f"❌ **Beeks:** 'Never heard of **{ticker.upper()}**.'", ephemeral=True)
+             return
+             
+        current_price = hist['Close'].iloc[-1] if not hist.empty else 0.0
+        
+        if not validate_atm_data(tkr, current_price):
+            await ctx.respond(f"❌ **Beeks:** 'Exchange connection bad. ATM options for **{yf_sym}** are showing zero data. Yahoo might be down.'", ephemeral=True)
+            return
+
+    except Exception as e:
+        await ctx.respond(f"❌ **Beeks:** 'Connection failed: {e}'", ephemeral=True)
+        return
+
+    await ctx.respond(f"⏳ **Beeks:** 'Data looks clean. Acquiring full chain for **{yf_sym}**...'", ephemeral=True)
+    
+    try:
+        start_time = time.time()
+        exps = tkr.options
+        div_yield = get_current_yield(yf_sym)
+        
+        if force_date:
+            ts_str = f"{force_date} 23:59:59"
+        else:
+            ts_str = datetime.datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S")
+
+        full_chain = {
+            "symbol": yf_sym,
+            "timestamp": ts_str,
+            "expirations": {}
+        }
+        
+        contract_count = 0
+        for e in exps:
+            try:
+                opt = tkr.option_chain(e)
+                c_list = opt.calls.to_dict(orient='records')
+                p_list = opt.puts.to_dict(orient='records')
+                
+                if not c_list and not p_list: continue
+                
+                full_chain["expirations"][e] = {
+                    "calls": c_list,
+                    "puts": p_list
+                }
+                contract_count += (len(c_list) + len(p_list))
+            except: pass
+            
+        save_status = "✅ **Asset Secured.**"
+        if contract_count < 100:
+             save_status = f"⚠️ **WARNING: DATA THIN.** Only {contract_count} contracts found."
+            
+        # Attempt Save
+        success = save_snapshot(yf_sym, full_chain, current_price, div_yield, tag=session.upper(), custom_timestamp=ts_str)
+        
+        duration = time.time() - start_time
+        
+        if success:
+            await ctx.respond(f"{save_status}\n**{yf_sym}** @ {current_price:.2f}\nYield: `{div_yield:.2%}`\n🏷️ Session: `{session.upper()}`\n📅 Date: `{ts_str}`\nContracts: **{contract_count}**\n⏱️ Time: {duration:.2f}s", ephemeral=True)
+        else:
+            await ctx.respond(f"❌ **Beeks:** 'Duplicate Tag. A snapshot for **{session.upper()}** already exists for this date. I won't overwrite it.'", ephemeral=True)
+        
+    except Exception as e:
+        await ctx.respond(f"⚠️ **Beeks:** 'Snapshot failed: {e}'", ephemeral=True)
+
+@beeks.command(name="delete_snapshot", description="ADMIN: Permanently remove a specific snapshot from history")
+@commands.has_permissions(administrator=True)
+async def beeks_delete_snapshot(
+    ctx: discord.ApplicationContext,
+    ticker: Option(str, name="ticker", description="Ticker Symbol", required=True),
+    replay_date: Option(str, name="replay_date", description="YYYY-MM-DD", autocomplete=get_db_dates, required=True),
+    session: Option(str, name="session", description="Session to delete", autocomplete=get_db_tags, required=True)
+):
+    await ctx.defer(ephemeral=True)
+    
+    yf_sym = get_options_ticker(resolve_yf_symbol(ticker))
+    success = delete_snapshot_from_db(yf_sym, replay_date, session)
+    
+    if success:
+        await ctx.respond(f"🗑️ **Beeks:** 'It's done. The file for **{yf_sym}** on **{replay_date}** [{session}] has been shredded.'", ephemeral=True)
+    else:
+        await ctx.respond(f"❌ **Beeks:** 'I couldn't find that file. Check the date and session again.'", ephemeral=True)
+
+@beeks.command(name="dailyrange", description="Get Volatility Ranges (Live or Historical)")
+async def beeks_dailyrange(
+    ctx: discord.ApplicationContext,
+    ticker: Option(str, name="ticker", description="Ticker Symbol", required=True),
+    engine: Option(str, name="engine", choices=["Insider Info", "Market Floor"], default="Insider Info"),
+    replay_date: Option(str, name="replay_date", description="YYYY-MM-DD (Market Replay)", autocomplete=get_db_dates, required=False),
+    session: Option(str, name="session", description="Session Tag", autocomplete=get_db_tags, required=False) # <--- RENAMED TO SESSION
+):
+    await ctx.defer(ephemeral=True)
+    
+    raw_ticker = ticker.upper()
+    yf_sym = resolve_yf_symbol(raw_ticker)
+    
+    FUTURES_MAP = {"ES": "ES=F", "NQ": "NQ=F", "YM": "YM=F", "RTY": "RTY=F"}
+    is_future = raw_ticker in FUTURES_MAP
+    futures_ticker = FUTURES_MAP.get(raw_ticker)
+
+    # --- MODE SELECTION ---
+    if replay_date:
+        # REPLAY MODE
+        tag_to_use = session # <--- USES NEW NAME
+        if not tag_to_use or "Select" in tag_to_use: 
+             db_ticker = get_options_ticker(yf_sym)
+             tag_to_use = get_latest_tag_for_date(db_ticker, replay_date)
+            
+        data = fetch_historical_data(yf_sym, replay_date, tag_to_use)
+        
+        # ... (rest of the replay logic remains the same) ...
+        if not data:
+            await ctx.respond(f"❌ **Beeks:** 'I couldn't find a **{tag_to_use}** file for **{replay_date}**.'", ephemeral=True)
+            return
+        
+        clean_footer = f"📼 REPLAY: {replay_date} [{tag_to_use}]"
+        movie_quote = random.choice(MOVIE_QUOTES)
+    else:
+        # LIVE MODE
+        is_supported_index = yf_sym in ["^GSPC", "^NDX"]
+        is_stock = not yf_sym.startswith("^") and not yf_sym.endswith("=F")
+        if not (is_supported_index or is_future or is_stock):
+             await ctx.respond(f"❌ **Beeks:** 'Incompatible Ticker.'", ephemeral=True)
+             return
+
+        data = fetch_market_data(yf_sym)
+        
+        # --- FAIL AND INFORM (STRICT) ---
+        if not data:
+            await ctx.respond(f"❌ **Beeks:** 'Live data for **{raw_ticker}** is corrupted/unsafe. **Try loading the latest Snapshot instead.**'", ephemeral=True)
+            return
+        # --------------------------------
+
+        clean_footer = f"🟢 LIVE FEED"
+        movie_quote = random.choice(MOVIE_QUOTES)
+        
+        if 'saved_at' in data:
+            clean_footer = f"⚠️ ARCHIVE DATA | {data['saved_at']}"
+
+    # --- CALCULATE & OUTPUT ---
+    levels = calculate_levels(data['anchor_price'], data['iv'], data['hv'], engine)
+    
+    basis = 0.0
+    display_price = data['anchor_price']
+    if is_future and not replay_date:
+        try:
+            ft = yf.Ticker(futures_ticker)
+            f_hist = ft.history(period="1d")
+            if not f_hist.empty:
+                f_price = f_hist['Close'].iloc[-1]
+                basis = f_price - data['anchor_price']
+                display_price = f_price
+                for key in levels['valentine']: levels['valentine'][key] += basis
+                for key in levels['winthorpe']: levels['winthorpe'][key] += basis
+                clean_footer += f" | ⚙️ BASIS ADJ: {basis:+.2f} ({raw_ticker})"
+        except Exception: pass
+
+    chart_data = data.copy()
+    chart_data['anchor_price'] = display_price
+    
+    view_setting = get_user_terminal_setting(ctx.author.id) 
+
+    if view_setting == "bloomberg":
+        # ASCII REPORT
+        msg = f"> **{movie_quote}**\n\n**{raw_ticker} VOLATILITY REPORT ({engine})**\n\n"
+        msg += f"`{'RANGE':<12} | {'VALUE':<12} | {'MOVE (PTS)':<12} | {'TYPE':<12}\n"
+        msg += "-"*56 + "\n"
+        
+        move_iv = levels['meta']['daily_move_iv']
+        move_hv = levels['meta']['daily_move_hv']
+        
+        msg += f"{'IV':<12} | {data['iv']:<12.4f} | {move_iv:<12.2f} | {'Implied'}\n"
+        msg += f"{'HV':<12} | {data['hv']:<12.4f} | {move_hv:<12.2f} | {'Historical'}\n`\n\n"
+        
+        msg += f"**{raw_ticker} LEVELS**\n"
+        msg += f"`{'LEVEL':<12} | {'VALENTINE':<15} | {'WINTHORPE':<15}\n"
+        msg += "-"*48 + "\n"
+        for i in range(4, 0, -1): 
+            val_v = levels['valentine'][f'+{i}σ'] 
+            val_w = levels['winthorpe'][f'+{i}σ'] 
+            msg += f"+{i}σ          | {val_v:<15.2f} | {val_w:<15.2f}\n" 
+        msg += f"PIVOT        | {display_price:.2f}\n" 
+        for i in range(1, 5): 
+            val_v = levels['valentine'][f'-{i}σ'] 
+            val_w = levels['winthorpe'][f'-{i}σ'] 
+            msg += f"-{i}σ          | {val_v:<15.2f} | {val_w:<15.2f}\n" 
+            
+        msg += f"`\n*{clean_footer}*"
+        await ctx.respond(msg, ephemeral=True)
+        return
+        
+    else: 
+        # CHART MODE (With Force Zoom)
+        buf = create_beeks_chart(raw_ticker, chart_data, levels, engine)
+        file = discord.File(buf, filename="beeks_report.png")
+        embed = discord.Embed(description=f"**{movie_quote}**", color=0x2b2d31)
+        embed.set_image(url="attachment://beeks_report.png")
+        embed.set_footer(text=clean_footer)
+        await ctx.respond(embed=embed, file=file, ephemeral=True)
+
+@beeks.command(name="gammaflip", description="Calculate Zero Gamma Level (Flip)")
+async def beeks_gammaflip(
+    ctx: discord.ApplicationContext,
+    ticker: Option(str, description="Ticker", required=True),
+    scope: Option(str, description="Data Scope", choices=["Front Month", "Total Market", "0DTE"], default="Front Month"),
+    replay_date: Option(str, name="replay_date", description="Backtest Date (YYYY-MM-DD)", autocomplete=get_db_dates, required=False),
+    session: Option(str, name="session", description="Session Tag", autocomplete=get_db_tags, required=False),
+    target_expiry: Option(str, name="target_expiry", description="Override Expiration (YYYY-MM-DD)", required=False)
+):
+    # Defer the interaction first
+    await ctx.defer(ephemeral=True)
+    
+    yf_sym = resolve_yf_symbol(ticker)
+    display_ticker = get_options_ticker(yf_sym)
+    
+    # --- SETUP DATES ---
+    calc_date = None
+    calc_tag = session
+    market_time = datetime.datetime.now(ZoneInfo("America/New_York"))
+    
+    # 1. Determine Target Expiration Date (The "View")
+    if target_expiry:
+        # MANUAL OVERRIDE: User explicitly asked for a specific date
+        target_date = target_expiry
+        status_msg = f"⏳ **Beeks:** 'Targeting specific expiration **{target_date}**...'"
+        
+        # If backtesting with manual target, ensure we have a snapshot date
+        if replay_date:
+            calc_date = replay_date
+            status_msg += f" (using {replay_date} [{calc_tag}])"
+            
+    elif scope == "0DTE" and not replay_date:
+        # AUTOMATIC 0DTE (LIVE/WEEKEND LOGIC)
+        # Determine the target date for the 0DTE contracts
+        if market_time.weekday() < 4 and market_time.hour < 16: # Mon-Thu, before close
+            target_date = market_time.strftime("%Y-%m-%d")
+        else:
+            # Weekend, Friday evening, or after hours: Calculate next market day
+            target_date = get_next_market_date(market_time)
+            
+        # Find the CLOSE snapshot that contains data for this target_date's 0DTE contracts
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        c.execute("SELECT date(timestamp) FROM chain_snapshots WHERE ticker = ? AND tag = 'CLOSE' ORDER BY timestamp DESC LIMIT 1", (display_ticker,))
+        row = c.fetchone()
+        conn.close()
+        
+        if not row:
+            await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'I can't run a 0DTE scan. I don't have a recent **CLOSE** snapshot.'")
+            return
+            
+        calc_date = row[0] # The date the snapshot was SAVED (e.g., Friday)
+        calc_tag = "CLOSE"
+        status_msg = f"⏳ **Beeks:** 'Loading **{target_date}** 0DTE setup from {calc_date} [CLOSE]...'"
+    
+    elif replay_date:
+        # STANDARD REPLAY
+        calc_date = replay_date
+        status_msg = f"⏳ **Beeks:** 'Running simulation on {replay_date} [{calc_tag}]...'"
+        target_date = replay_date # Default to the replay date itself if no override
+    else:
+        # STANDARD LIVE
+        status_msg = f"⏳ **Beeks:** 'Scanning {scope} for {display_ticker}...'"
+        target_date = None
+
+    # Send initial deferred message status using the interaction object
+    await ctx.interaction.edit_original_response(content=status_msg)
+
+    # --- FETCH ---
+    raw_data = fetch_and_enrich_chain(
+        ticker=ticker,
+        expiry_date=target_date, # Pass the specific expiration date we need
+        snapshot_date=calc_date,
+        snapshot_tag=calc_tag,
+        scope=scope,
+        range_count=None
+    )
+    
+    if not raw_data:
+        # Check if they were trying Live mode
+        if not replay_date:
+             await ctx.respond(f"❌ **Beeks:** 'Live data for {ticker} is corrupt/empty. **Try loading a recent snapshot instead.**'", ephemeral=True)
+        else:
+             await ctx.respond(f"❌ **Beeks:** 'No snapshot found for {ticker} on {replay_date}.'", ephemeral=True)
+        return
+
+    # Extract Spot
+    spot_price = raw_data[0].get('spot')
+    if not spot_price:
+        try: spot_price = yf.Ticker(yf_sym).history(period="1d")['Close'].iloc[-1]
+        except: spot_price = 0
+    
+    # --- CALCULATE FLIP ---
+    flip_price, plot_data = calculate_gamma_flip(raw_data, spot_price)
+    
+    # --- RENDER ---
+    # Use the simplified global getter
+    view_setting = get_user_terminal_setting(ctx.author.id)
+    quote = random.choice(MOVIE_QUOTES)
+    
+    if view_setting == 'modern' and plot_data:
+        # GENERATE CHART
+        sim_spots, net_gammas = plot_data
+        
+        plt.figure(figsize=(10, 6))
+        plt.style.use('dark_background')
+        
+        plt.plot(sim_spots, net_gammas, color='cyan', linewidth=2)
+        plt.fill_between(sim_spots, net_gammas, 0, where=(net_gammas >= 0), color='green', alpha=0.3)
+        plt.fill_between(sim_spots, net_gammas, 0, where=(net_gammas < 0), color='red', alpha=0.3)
+        plt.axhline(0, color='white', linestyle='--', linewidth=1)
+        plt.axvline(spot_price, color='yellow', linestyle=':', label='Spot')
+        
+        title_extra = ""
+        if flip_price:
+            plt.axvline(flip_price, color='magenta', linewidth=2, label='Flip')
+            title_extra = f" | FLIP: {flip_price:.2f}"
+            plt.text(flip_price, max(net_gammas)*0.1, f"{flip_price:.0f}", color='magenta', fontweight='bold')
+        else:
+            title_extra = " | NO FLIP FOUND"
+            
+        plt.title(f"Gamma Profile: {display_ticker}{title_extra}", color='white', fontweight='bold')
+        plt.ylabel("Net Gamma Exposure ($)", color='white')
+        plt.grid(True, alpha=0.2)
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e')
+        buf.seek(0); plt.close()
+        
+        file = discord.File(buf, filename="gamma_flip.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31)
+        embed.set_image(url="attachment://gamma_flip.png")
+        
+        footer_txt = f"Simulated Range: {min(sim_spots):.0f} - {max(sim_spots):.0f}"
+        if calc_date: footer_txt += f" | REF: {calc_date}"
+        if target_date: footer_txt += f" | TARGET: {target_date}"
+        
+        embed.set_footer(text=footer_txt)
+        # FIX: Use ctx.interaction.edit_original_response
+        await ctx.interaction.edit_original_response(content="", embed=embed, file=file)
+        
+    else:
+        # TEXT ONLY
+        res_str = f"**{quote}**\n\n"
+        res_str += f"**GAMMA FLIP REPORT: {display_ticker}**\n"
+        if target_date: res_str += f"Target Expiry: {target_date}\n"
+        res_str += f"Spot Price: {spot_price:.2f}\n"
+        res_str += ("-" * 30) + "\n"
+        
+        if flip_price:
+            diff = flip_price - spot_price
+            status = "BULLISH (Spot > Flip)" if spot_price > flip_price else "BEARISH (Spot < Flip)"
+            res_str += f"**FLIP LEVEL: {flip_price:.2f}**\n"
+            res_str += f"Distance: {diff:+.2f} ({diff/spot_price:.2%})\n"
+            res_str += f"Regime: {status}\n"
+        else:
+            res_str += "⚠️ **NO FLIP DETECTED**\n"
+            res_str += "Market is dominated by one side (likely Negative Gamma).\n"
+            
+        # FIX: Use ctx.interaction.edit_original_response
+        await ctx.interaction.edit_original_response(content=res_str)
+
+@beeks.command(name="exposures", description="Show Dealer Dollar Exposure (GEX/DEX/VEX)")
+async def beeks_exposures(
+    ctx: discord.ApplicationContext,
+    ticker: Option(str, description="Ticker", required=True),
+    scope: Option(str, description="Data Scope", choices=["Front Month", "Total Market", "0DTE"], default="Front Month"),
+    replay_date: Option(str, name="replay_date", description="Backtest Date (YYYY-MM-DD)", autocomplete=get_db_dates, required=False),
+    session: Option(str, name="session", description="Session Tag", autocomplete=get_db_tags, required=False),
+    target_expiry: Option(str, name="target_expiry", description="Override Expiration (YYYY-MM-DD)", required=False)
+):
+    # Defer the interaction first
+    await ctx.defer(ephemeral=True)
+    
+    yf_sym = resolve_yf_symbol(ticker)
+    display_ticker = get_options_ticker(yf_sym)
+    
+    # --- SETUP DATES ---
+    calc_date = None
+    calc_tag = session
+    market_time = datetime.datetime.now(ZoneInfo("America/New_York"))
+    
+    # 1. Determine Target Expiration Date
+    if target_expiry:
+        # MANUAL OVERRIDE
+        target_date = target_expiry
+        status_msg = f"⏳ **Beeks:** 'Calculating exposures for **{target_date}**...'"
+        
+        if replay_date:
+            calc_date = replay_date
+            status_msg += f" (using {replay_date} [{calc_tag}])"
+            
+    elif scope == "0DTE" and not replay_date:
+        # AUTOMATIC 0DTE (LIVE/WEEKEND LOGIC)
+        if market_time.weekday() < 4 and market_time.hour < 16: # Mon-Thu, before close
+            target_date = market_time.strftime("%Y-%m-%d")
+        else:
+            # Weekend/After Hours -> Next Market Day
+            target_date = get_next_market_date(market_time)
+            
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        c.execute("SELECT date(timestamp) FROM chain_snapshots WHERE ticker = ? AND tag = 'CLOSE' ORDER BY timestamp DESC LIMIT 1", (display_ticker,))
+        row = c.fetchone()
+        conn.close()
+        
+        if not row:
+            await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'I can't run a 0DTE scan. I don't have a recent **CLOSE** snapshot.'")
+            return
+            
+        calc_date = row[0]
+        calc_tag = "CLOSE"
+        status_msg = f"⏳ **Beeks:** 'Loading **{target_date}** 0DTE exposures from {calc_date} [CLOSE]...'"
+    
+    elif replay_date:
+        # REPLAY
+        calc_date = replay_date
+        status_msg = f"⏳ **Beeks:** 'Running exposure simulation on {replay_date} [{calc_tag}]...'"
+        target_date = replay_date 
+    else:
+        # LIVE / STANDARD
+        status_msg = f"⏳ **Beeks:** 'Scanning {scope} exposures for {display_ticker}...'"
+        target_date = None
+
+    await ctx.interaction.edit_original_response(content=status_msg)
+
+    # --- FETCH DATA ---
+    raw_data = fetch_and_enrich_chain(
+        ticker=ticker,
+        expiry_date=target_date, 
+        snapshot_date=calc_date,
+        snapshot_tag=calc_tag,
+        scope=scope,
+        range_count=9999 
+    )
+    
+    if not raw_data:
+        # Check if they were trying Live mode
+        if not replay_date:
+             await ctx.respond(f"❌ **Beeks:** 'Live data for {ticker} is corrupt/empty. **Try loading a recent snapshot instead.**'", ephemeral=True)
+        else:
+             await ctx.respond(f"❌ **Beeks:** 'No snapshot found for {ticker} on {replay_date}.'", ephemeral=True)
+        return
+
+    spot_price = raw_data[0]['spot']
+    if not spot_price:
+        try: spot_price = yf.Ticker(yf_sym).history(period="1d")['Close'].iloc[-1]
+        except: spot_price = 0
+    
+    # --- CALCULATE EXPOSURES ---
+    gex, dex, vex = calculate_market_exposures(raw_data, spot_price)
+    
+    # --- RENDER ---
+    view_setting = get_user_terminal_setting(ctx.author.id)
+    quote = random.choice(MOVIE_QUOTES)
+
+    if view_setting == 'modern':
+        # MODERN MODE: GRAPHICAL DASHBOARD
+        img_buf = generate_exposure_dashboard(
+            display_ticker, spot_price, gex, dex, vex, scope, target_date
+        )
+        file = discord.File(img_buf, filename="exposures.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31)
+        embed.set_image(url="attachment://exposures.png")
+        await ctx.interaction.edit_original_response(content="", embed=embed, file=file)
+        
+    else:
+        # BLOOMBERG MODE: ASCII TERMINAL REPORT
+        def fmt_term(val, is_vanna=False):
+            d = 1_000_000 if is_vanna else 1_000_000_000
+            suffix = "M" if is_vanna else "B"
+            return f"${val/d:>7.2f} {suffix}"
+
+        regime = "DAMPENED VOL" if gex > 0 else "ACCELERATED VOL"
+        date_display = target_date if target_date else datetime.datetime.now().strftime("%Y-%m-%d")
+        
+        # ASCII Table Construction
+        lines = [
+            f"> **{quote}**", # Quote Moved to TOP
+            f"```yaml",
+            f"+--------------------------------------------------+",
+            f"| CLARENCE BEEKS TERMINAL v2.0      [EXPOSURE]     |",
+            f"+--------------------------------------------------+",
+            f"| TICKER: {display_ticker:<16} SPOT: {spot_price:<15.2f} |",
+            f"| SCOPE:  {scope:<16} DATE: {date_display:<15} |",
+            f"+--------------------------------------------------+",
+            f"| MARKET MAKER EXPOSURE PROFILE                    |",
+            f"+--------------------------------------------------+",
+            f"| GEX (GAMMA)   : {fmt_term(gex):<12} / 1% Move      |",
+            f"| DEX (DELTA)   : {fmt_term(dex):<12} Net Notional   |",
+            f"| VEX (VANNA)   : {fmt_term(vex, True):<12} / 1% IV Change |",
+            f"+--------------------------------------------------+",
+            f"| REGIME: {regime:<32} |",
+            f"+--------------------------------------------------+",
+            f"```"
+        ]
+        
+        await ctx.interaction.edit_original_response(content="\n".join(lines))
+
+# --- SCHEDULED TASKS ---
+sched_times = [
+    datetime.time(hour=9, minute=45, tzinfo=ZoneInfo("America/New_York")),
+    datetime.time(hour=12, minute=0, tzinfo=ZoneInfo("America/New_York")),
+    datetime.time(hour=15, minute=50, tzinfo=ZoneInfo("America/New_York"))
+]
+
+@tasks.loop(time=sched_times)
+async def auto_fetch_heavy_chains():
+    now = datetime.datetime.now(ZoneInfo("America/New_York"))
+    if now.weekday() > 4: return
+
+    if now.hour < 11:
+        session_tag = "OPEN"
+    elif now.hour < 14:
+        session_tag = "MID"
+    else:
+        session_tag = "CLOSE"
+
+    print(f"\n⏰ STARTING AUTO-FETCH [{session_tag}]")
+    
+    targets = ["^SPX", "^NDX"]
+    
+    for symbol in targets:
+        try:
+            tkr = yf.Ticker(symbol)
+            hist = tkr.history(period="1d")
+            if hist.empty: continue
+            current_price = hist['Close'].iloc[-1]
+            
+            if not validate_atm_data(tkr, current_price):
+                print(f"   ❌ SKIPPING {symbol}: ATM Data invalid (Yahoo Down/Glitch).")
+                continue
+
+            div_yield = get_current_yield(symbol)
+            exps = tkr.options
+            
+            ts_str = now.strftime("%Y-%m-%d %H:%M:%S")
+            
+            full_chain = {
+                "symbol": symbol,
+                "timestamp": ts_str,
+                "expirations": {}
+            }
+            
+            contract_count = 0
+            for e in exps:
+                try:
+                    opt = tkr.option_chain(e)
+                    c_list = opt.calls.to_dict(orient='records')
+                    p_list = opt.puts.to_dict(orient='records')
+                    
+                    if not c_list and not p_list: continue
+                    
+                    full_chain["expirations"][e] = {
+                        "calls": c_list,
+                        "puts": p_list
+                    }
+                    contract_count += (len(c_list) + len(p_list))
+                except: pass
+            
+            if contract_count < 50:
+                print(f"   ❌ ABORTED {symbol}: Chain empty ({contract_count}).")
+                continue
+                
+            save_snapshot(symbol, full_chain, current_price, div_yield, tag=session_tag, custom_timestamp=ts_str)
+            print(f"   ✅ FINISHED {symbol}: Saved {contract_count} contracts.")
+            
+        except Exception as e:
+            print(f"   ❌ CRITICAL FAIL {symbol}: {e}")
+
+@beeks.command(name="strikes", description="Visualize Net Exposure per Strike")
+async def beeks_strikes(
+    ctx: discord.ApplicationContext,
+    ticker: Option(str, description="Ticker", required=True),
+    scope: Option(str, description="Data Scope", choices=["Front Month", "Total Market", "0DTE"], required=True),
+    metric: Option(str, description="View Mode", choices=["CONFLUENCE", "ALL", "GEX", "DEX", "VEX"], default="ALL"),
+    target_expiry: Option(str, name="target_expiry", description="Override Expiration (YYYY-MM-DD)", required=False),
+    replay_date: Option(str, name="replay_date", description="Backtest Date", autocomplete=get_db_dates, required=False),
+    session: Option(str, name="session", description="Session Tag", autocomplete=get_db_tags, required=False)
+):
+    await ctx.defer(ephemeral=True)
+    
+    yf_sym = resolve_yf_symbol(ticker)
+    display_ticker = get_options_ticker(yf_sym)
+    
+    # --- SETUP DATES ---
+    calc_date = None
+    calc_tag = session
+    market_time = datetime.datetime.now(ZoneInfo("America/New_York"))
+    
+    if target_expiry:
+        target_date = target_expiry
+        if replay_date: calc_date = replay_date
+    elif scope == "0DTE" and not replay_date:
+        if market_time.weekday() < 4 and market_time.hour < 16:
+            target_date = market_time.strftime("%Y-%m-%d")
+        else:
+            target_date = get_next_market_date(market_time)
+        
+        conn = sqlite3.connect("beeks.db")
+        c = conn.cursor()
+        c.execute("SELECT date(timestamp) FROM chain_snapshots WHERE ticker = ? AND tag = 'CLOSE' ORDER BY timestamp DESC LIMIT 1", (display_ticker,))
+        row = c.fetchone()
+        conn.close()
+        if row:
+            calc_date = row[0]
+            calc_tag = "CLOSE"
+    elif replay_date:
+        calc_date = replay_date
+        target_date = replay_date
+    else:
+        target_date = None
+
+    await ctx.interaction.edit_original_response(content=f"⏳ **Beeks:** 'Mapping {metric} for {display_ticker}...'")
+
+    # --- FETCH ---
+    raw_data = fetch_and_enrich_chain(
+        ticker=ticker,
+        expiry_date=target_date, 
+        snapshot_date=calc_date,
+        snapshot_tag=calc_tag,
+        scope=scope,
+        range_count=9999 
+    )
+    
+    if not raw_data:
+        await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'No data found.'")
+        return
+
+    spot_price = raw_data[0]['spot']
+    
+    # --- CALCULATE ---
+    strike_data = calculate_strike_exposures(raw_data, spot_price, display_ticker)
+    
+    # --- CALCULATE CONFLUENCE (Top 5 Logic) ---
+    def get_top_strikes(vals, n=5):
+        paired = zip(strike_data['strikes'], vals)
+        paired = [p for p in paired if abs(p[1]) > 0]
+        top = sorted(paired, key=lambda x: abs(x[1]), reverse=True)[:n]
+        return {x[0] for x in top}
+
+    top_gex = get_top_strikes(strike_data['gex'])
+    top_dex = get_top_strikes(strike_data['dex'])
+    top_vex = get_top_strikes(strike_data['vex'])
+    
+    all_significant = top_gex | top_dex | top_vex
+    
+    confluence_map = []
+    for k in all_significant:
+        score = 0
+        reasons = []
+        if k in top_gex: score += 1; reasons.append("G")
+        if k in top_dex: score += 1; reasons.append("D")
+        if k in top_vex: score += 1; reasons.append("V")
+        confluence_map.append({'strike': k, 'score': score, 'tags': "".join(reasons)})
+        
+    confluence_map.sort(key=lambda x: (x['score'], x['strike']), reverse=True)
+
+    view_setting = get_user_terminal_setting(ctx.author.id)
+    quote = random.choice(MOVIE_QUOTES)
+
+    if view_setting == 'modern':
+        # MODERN CHART
+        img_buf = generate_strike_chart(display_ticker, spot_price, strike_data, metric, confluence_map)
+        file = discord.File(img_buf, filename="strikes.png")
+        
+        # Text Desc (Summary)
+        desc = f"**{quote}**\n"
+        if metric == "CONFLUENCE":
+            desc += "\n**🎯 STRUCTURAL OVERLAP (Top 5)**\n"
+            for item in confluence_map[:5]:
+                stars = "⭐" * item['score']
+                desc += f"`{int(item['strike']):<5}` {stars} ({item['tags']})\n"
+        
+        embed = discord.Embed(color=0x2b2d31, description=desc)
+        embed.set_image(url="attachment://strikes.png")
+        
+        ft = f"Spot: {spot_price:.2f} | Scope: {scope}"
+        if target_date: ft += f" | Exp: {target_date}"
+        embed.set_footer(text=ft)
+        
+        await ctx.interaction.edit_original_response(content="", embed=embed, file=file)
+        
+    else:
+        # BLOOMBERG TERMINAL v2.0
+        lines = [f"> **{quote}**"]
+        
+        # IF CONFLUENCE MODE -> ONLY SHOW CONFLUENCE TABLE
+        if metric == "CONFLUENCE":
+            lines.append(f"```yaml")
+            lines.append(f"+--------------------------------------------------+")
+            lines.append(f"| KEY LEVELS (HIGHEST OVERLAP)                     |")
+            lines.append(f"+--------------------------------------------------+")
+            lines.append(f"| STRIKE  | SCORE | DRIVERS                        |")
+            lines.append(f"+--------------------------------------------------+")
+            
+            if not confluence_map:
+                 lines.append(f"| NO SIGNIFICANT LEVELS FOUND                      |")
+            else:
+                for item in confluence_map: # Show ALL significant (up to reasonable limit)
+                    score_bar = "*" * item['score']
+                    marker = "<" if item['strike'] == calculate_atm_strike(spot_price) else " "
+                    lines.append(f"| {int(item['strike']):<7} | {score_bar:<5} | {item['tags']:<30} {marker}|")
+            lines.append(f"+--------------------------------------------------+")
+            lines.append(f"```")
+            
+        else:
+            # STANDARD MODES (GEX/DEX/VEX/ALL)
+            metrics_to_show = ["GEX", "DEX", "VEX"] if metric == "ALL" else [metric]
+            
+            for m_show in metrics_to_show:
+                strikes = strike_data['strikes']
+                vals = strike_data[m_show.lower()]
+                
+                paired = sorted(zip(strikes, vals), key=lambda x: abs(x[1]), reverse=True)[:10]
+                paired = sorted(paired, key=lambda x: x[0], reverse=True) 
+                
+                if not paired: continue
+                max_val = max([abs(x[1]) for x in paired])
+                
+                lines.append(f"```yaml")
+                lines.append(f"+--------------------------------------------------+")
+                lines.append(f"| {display_ticker:<10} SPOT: {spot_price:<9.2f} [{m_show} WALLS]      |")
+                lines.append(f"+--------------------------------------------------+")
+                
+                for k, v in paired:
+                    val_fmt = f"{v/1_000_000_000:+.2f}"
+                    bar_len = int((abs(v) / max_val) * 10)
+                    bar_char = "=" if v > 0 else "-"
+                    bar_vis = bar_char * bar_len
+                    
+                    is_key = any(c['strike'] == k and c['score'] >= 2 for c in confluence_map)
+                    key_mark = "*" if is_key else " "
+                    
+                    lines.append(f"| {int(k):<6} | {val_fmt:>7} B | {bar_vis:<10} {key_mark} |")
+                lines.append(f"+--------------------------------------------------+")
+                lines.append(f"```")
+        
+        # Paginate if needed (simple check)
+        final_msg = "\n".join(lines)
+        if len(final_msg) > 1900:
+            # Split roughly
+            chunks = [final_msg[i:i+1900] for i in range(0, len(final_msg), 1900)]
+            await ctx.interaction.edit_original_response(content=chunks[0])
+            for c in chunks[1:]:
+                await ctx.followup.send(content=f"```yaml\n{c}", ephemeral=True)
+        else:
+            await ctx.interaction.edit_original_response(content=final_msg)
+
+@beeks.command(name="chain", description="View Raw Chain (Live or Backtest)")
+async def beeks_chain(
+    ctx: discord.ApplicationContext,
+    ticker: Option(str, description="Ticker Symbol", required=True),
+    expiry: Option(str, name="expiry", description="YYYY-MM-DD (Optional)", required=False),
+    center: Option(float, name="center", description="Center Strike (Default: Spot)", required=False),
+    rows: Option(int, name="rows", description="Rows to show", choices=[1, 3, 5, 10], default=10),
+    replay_date: Option(str, name="replay_date", description="Backtest Date", autocomplete=get_db_dates, required=False),
+    session: Option(str, name="session", description="Session Tag", autocomplete=get_db_tags, required=False)
+):
+    await ctx.defer(ephemeral=True)
+
+    # --- 1. SETUP & FETCH ---
+    yf_sym = resolve_yf_symbol(ticker)
+    display_ticker = get_options_ticker(yf_sym)
+    
+    actual_rows = 11 if rows == 10 else rows
+
+    # Backtest Logic
+    calc_date = replay_date if replay_date else None
+    calc_tag = session
+    if calc_date and not calc_tag:
+        calc_tag = get_latest_tag_for_date(display_ticker, calc_date)
+
+    # Fetch Data
+    data = fetch_and_enrich_chain(
+        ticker=ticker,
+        expiry_date=expiry,
+        snapshot_date=calc_date,
+        snapshot_tag=calc_tag,
+        scope="Specific" if expiry else "Front Month",
+        range_count=actual_rows,
+        pivot=center
+    )
+    
+    if not data:
+        mode = f"REPLAY {calc_date}" if calc_date else "LIVE"
+        await ctx.respond(f"❌ **Beeks:** 'No data found for {ticker} ({mode}). Check your dates.'", ephemeral=True)
+        return
+
+    # Meta Data
+    spot = data[0]['spot']
+    target_date = expiry if expiry else "FRONT MONTH"
+    view_setting = get_user_terminal_setting(ctx.author.id)
+    quote = random.choice(MOVIE_QUOTES)
+    
+    # Source Label
+    if calc_date:
+        source_label = f"DB: {calc_date} [{calc_tag}]"
+    else:
+        source_label = "LIVE"
+
+    closest_strike = min([d['strike'] for d in data], key=lambda x: abs(x - spot))
+
+    # Process Data
+    table_rows = []
+    
+    grouped = {}
+    for row in data:
+        k = row['strike']
+        if k not in grouped: grouped[k] = {'C': None, 'P': None}
+        if row['type'].lower().startswith('c'): grouped[k]['C'] = row
+        else: grouped[k]['P'] = row
+    
+    # --- FIX: REVERSE SORT (DOM STYLE / HIGH TO LOW) ---
+    sorted_strikes = sorted(grouped.keys(), reverse=True)
+
+    for k in sorted_strikes:
+        c = grouped[k]['C']
+        p = grouped[k]['P']
+        
+        # Safe Unpacking
+        c_iv = c.get('iv', 0) if c else 0
+        c_delta = c.get('delta', 0) if c else 0
+        c_gamma = c.get('gamma', 0) if c else 0
+        c_theta = c.get('theta', 0) if c else 0
+        c_vol = c.get('volume', 0) if c else 0
+        c_oi = c.get('oi', 0) if c else 0
+        
+        p_iv = p.get('iv', 0) if p else 0
+        p_delta = p.get('delta', 0) if p else 0
+        p_gamma = p.get('gamma', 0) if p else 0
+        p_theta = p.get('theta', 0) if p else 0
+        p_vol = p.get('volume', 0) if p else 0
+        p_oi = p.get('oi', 0) if p else 0
+
+        table_rows.append({
+            'strike': k,
+            'c_iv': c_iv, 'c_delta': c_delta, 'c_gamma': c_gamma, 'c_theta': c_theta, 'c_vol': c_vol, 'c_oi': c_oi,
+            'p_iv': p_iv, 'p_delta': p_delta, 'p_gamma': p_gamma, 'p_theta': p_theta, 'p_vol': p_vol, 'p_oi': p_oi
+        })
+
+    # --- 2. RENDER: MODERN MODE (IMAGE) ---
+    if view_setting == 'modern':
+        # Create Table Plot
+        plt.figure(figsize=(16, len(table_rows) * 0.5 + 3))
+        plt.style.use('dark_background')
+        ax = plt.gca()
+        ax.axis('off')
+        
+        # Vol -> OI -> IV -> Theta -> Gamma -> Delta -> STRIKE -> Delta -> Gamma -> Theta -> IV -> OI -> Vol
+        cols = ['VOL', 'OI', 'IV', 'THETA', 'GAMMA', 'DELTA', 'STRIKE', 'DELTA', 'GAMMA', 'THETA', 'IV', 'OI', 'VOL']
+        cell_text = []
+        cell_colors = []
+        
+        for row in table_rows:
+            c_bg = '#003300' if row['strike'] < spot else '#222222'
+            p_bg = '#330000' if row['strike'] > spot else '#222222'
+            s_bg = '#444444' 
+            if row['strike'] == closest_strike: s_bg = '#AA8800' 
+
+            r_colors = [c_bg]*6 + [s_bg] + [p_bg]*6
+
+            r_data = [
+                f"{int(row['c_vol'])}", f"{int(row['c_oi'])}", f"{row['c_iv']:.1%}", f"{row['c_theta']:.2f}", f"{row['c_gamma']:.3f}", f"{row['c_delta']:.2f}",
+                f"{row['strike']:.0f}",
+                f"{row['p_delta']:.2f}", f"{row['p_gamma']:.3f}", f"{row['p_theta']:.2f}", f"{row['p_iv']:.1%}", f"{int(row['p_oi'])}", f"{int(row['p_vol'])}"
+            ]
+            cell_text.append(r_data)
+            cell_colors.append(r_colors)
+
+        table = plt.table(cellText=cell_text, colLabels=cols, cellColours=cell_colors, loc='center', cellLoc='center')
+        table.auto_set_font_size(False)
+        table.set_fontsize(9)
+        table.scale(1, 1.8) 
+        
+        for (i, j), cell in table.get_celld().items():
+            if i == 0: 
+                cell.set_text_props(weight='bold', color='white')
+                cell.set_facecolor('#111111') 
+                cell.set_edgecolor('white')
+                cell.set_linewidth(1)
+            else:
+                cell.set_edgecolor('#555555')
+                cell.set_linewidth(0.5)
+
+        header = f"{display_ticker} CHAIN  |  EXPIRY: {target_date}  |  SPOT: {spot:.2f}\nFEED: {source_label}"
+        plt.title(header, color='white', pad=20, fontsize=14, weight='bold')
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e', dpi=120)
+        buf.seek(0); plt.close()
+        
+        file = discord.File(buf, filename="chain_modern.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31)
+        embed.set_image(url="attachment://chain_modern.png")
+        await ctx.respond(embed=embed, file=file, ephemeral=True)
+
+    # --- 3. RENDER: BLOOMBERG MODE (ASCII) ---
+    else:
+        def fmt_5(val):
+            val = int(val)
+            if val >= 1_000_000: s = f"{val/1_000_000:.1f}m"
+            elif val >= 1_000: s = f"{val/1_000:.0f}k"
+            else: s = str(val)
+            return f"{s:>5}"
+
+        lines = [
+            f"> **{quote}**",
+            f"```yaml",
+            f"TICKER: {display_ticker}  SPOT: {spot:.2f}",
+            f"EXP: {target_date}  SRC: {source_label}",
+            f"-"*74,
+            f"|{'CALLS':^32}|{'':^6}|{'PUTS':^32}|",
+            f"|{'V':>5}{'OI':>5}{'IV':>4}{'TH':>6}{'GM':>6}{'DL':>6}|{'STRK':^6}|{'DL':>6}{'GM':>6}{'TH':>6}{'IV':>4}{'OI':>5}{'V':>5}|",
+            f"-"*74
+        ]
+        
+        for row in table_rows:
+            s_str = f"{row['strike']:.0f}"
+            strike_display = f">{s_str}<" if row['strike'] == closest_strike else s_str
+            
+            line = (
+                f"|{fmt_5(row['c_vol'])}{fmt_5(row['c_oi'])}{row['c_iv']:>4.0%}"
+                f"{row['c_theta']:>6.2f}{row['c_gamma']:>6.3f}{row['c_delta']:>6.2f}"
+                f"|{strike_display:^6}|"
+                f"{row['p_delta']:>6.2f}{row['p_gamma']:>6.3f}{row['p_theta']:>6.2f}"
+                f"{row['p_iv']:>4.0%}{fmt_5(row['p_oi'])}{fmt_5(row['p_vol'])}|"
+            )
+            lines.append(line)
+            
+        lines.append(f"-"*74)
+        lines.append(f"```")
+        
+        final_text = "\n".join(lines)
+        if len(final_text) > 1950:
+            await ctx.respond(final_text[:1950] + "\n```... (Truncated)", ephemeral=True)
+        else:
+            await ctx.respond(final_text, ephemeral=True)
+
+@bot.event
+async def on_ready():
+    init_db()
+    if not auto_fetch_heavy_chains.is_running():
+        auto_fetch_heavy_chains.start()
+        
+    print(f"🍊 Duke & Duke: Clarence Beeks is Online. Logged in as {bot.user}")
+    await bot.sync_commands()
+
+bot.run(CONFIG["DISCORD_TOKEN"])

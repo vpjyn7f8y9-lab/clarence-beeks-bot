@@ -1623,7 +1623,7 @@ async def beeks_vig(
         calc_tag = get_latest_tag_for_date(db_ticker, calc_date)
 
     # Fetch
-    scope = "Specific" if expiry else "Front Month"
+    scope = "Specific" if expiry else "0DTE"
     data = fetch_and_enrich_chain(
         ticker=ticker, expiry_date=expiry, 
         snapshot_date=calc_date, snapshot_tag=calc_tag, 

@@ -1,11 +1,8 @@
 import asyncio
 import os
 import sys
-
-# --- HEADLESS MODE FIX ---
 import matplotlib
 matplotlib.use('Agg') 
-
 import discord
 from dotenv import load_dotenv
 from discord.ext import commands, tasks
@@ -24,18 +21,12 @@ import json
 import time
 import scipy.stats as si
 import pytz
-
-load_dotenv()
+from matplotlib.patches import Rectangle, Patch
 
 # --- CONFIGURATION ---
-guilds_env = os.getenv("GUILD_IDS", "")
-guild_ids = [int(g.strip()) for g in guilds_env.split(",") if g.strip()] if guilds_env else None
-
-CONFIG = {
-    "DISCORD_TOKEN": os.getenv("DISCORD_TOKEN"),
-    "GUILD_IDS": guild_ids,
-    "PROJECT_ID": os.getenv("PROJECT_ID")
-}
+# If you have a .env file, this works. If not, paste token at the bottom.
+load_dotenv()
+TOKEN = os.getenv("DISCORD_TOKEN") 
 
 # --- BEEKS QUOTES ---
 MOVIE_QUOTES = [
@@ -74,6 +65,34 @@ MOVIE_QUOTES = [
     "Boo bwele boo bwele boo bwele ah ha! Boo bwele boo bwele boo bwele ah ha!",
     "Something's wrong! Where's Wilson?"
 ]
+
+# --- SYMBOL MAPPINGS ---
+YF_SYMBOLS = {
+    "spx": "^GSPC", "es": "^GSPC",
+    "ndx": "^NDX",  "nq": "^NDX",
+    "rut": "^RUT",  "rty": "^RUT",
+    "ym": "YM=F",   "dow": "YM=F",
+    "vix": "^VIX",  "sp": "^GSPC",
+    "spy": "SPY",   "qqq": "QQQ",
+    "iwm": "IWM",   "dia": "DIA",
+    "vixy": "VIXY", "uvxy": "UVXY",
+    "tlt": "TLT",   "hyg": "HYG"
+}
+
+IV_PROXIES = { "^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM" }
+
+def resolve_yf_symbol(user_input: str) -> str:
+    return YF_SYMBOLS.get(user_input.lower(), user_input.upper())
+
+def get_options_ticker(yf_sym):
+    if yf_sym == "^GSPC": return "^SPX"
+    return yf_sym
+
+def is_third_friday(date_str):
+    try:
+        d = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
+        return d.weekday() == 4 and 15 <= d.day <= 21
+    except: return False
 
 # --- DATABASE ENGINE ---
 def init_db():
@@ -486,6 +505,12 @@ def fetch_and_enrich_chain(ticker, expiry_date, snapshot_date=None, snapshot_tag
             if hist.empty: return None
             S = hist['Close'].iloc[-1]
             q = get_current_yield(yf_sym)
+
+            # --- 🔥 THIS IS THE FIX: DATA VALIDATION ADDED HERE 🔥 ---
+            if not validate_atm_data(tkr, S):
+                print(f"DEBUG: Data Validation Failed for {yf_sym} (Garbage IVs)")
+                return None
+            # ---------------------------------------------------------
             
             search_tkr = tkr
             if yf_sym == "^GSPC":
@@ -591,7 +616,7 @@ def fetch_and_enrich_chain(ticker, expiry_date, snapshot_date=None, snapshot_tag
                 'iv': IV, 
                 'delta': delta, 'gamma': gamma, 'theta': theta, 
                 'vanna': vanna, 'charm': charm,
-                'time_year': row.get('time_year', 0), # <--- THIS WAS MISSING
+                'time_year': row.get('time_year', 0),
                 'spot': S
             }
             results.append(item)
@@ -645,8 +670,8 @@ def calculate_black_scholes(S, K, T, r, sigma, q=0.0, option_type="call"):
         if option_type == "call":
             delta = np.exp(-q * T) * N_d1
             theta = (- (S * sigma * np.exp(-q * T) * pdf_d1) / (2 * np.sqrt(T)) 
-                     - r * K * np.exp(-r * T) * N_d2 
-                     + q * S * np.exp(-q * T) * N_d1) / 365.0
+                      - r * K * np.exp(-r * T) * N_d2 
+                      + q * S * np.exp(-q * T) * N_d1) / 365.0
             
             term1 = q * np.exp(-q * T) * N_d1
             term2 = np.exp(-q * T) * pdf_d1 * (2 * (r - q) * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))
@@ -655,8 +680,8 @@ def calculate_black_scholes(S, K, T, r, sigma, q=0.0, option_type="call"):
         else:
             delta = np.exp(-q * T) * (N_d1 - 1)
             theta = (- (S * sigma * np.exp(-q * T) * pdf_d1) / (2 * np.sqrt(T)) 
-                     + r * K * np.exp(-r * T) * (1 - N_d2) 
-                     - q * S * np.exp(-q * T) * (1 - N_d1)) / 365.0
+                      + r * K * np.exp(-r * T) * (1 - N_d2) 
+                      - q * S * np.exp(-q * T) * (1 - N_d1)) / 365.0
             
             term1 = -q * np.exp(-q * T) * (1 - N_d1)
             term2 = np.exp(-q * T) * pdf_d1 * (2 * (r - q) * T - d2 * sigma * np.sqrt(T)) / (2 * T * sigma * np.sqrt(T))
@@ -996,33 +1021,7 @@ try:
 except RuntimeError:
     asyncio.set_event_loop(asyncio.new_event_loop())
 
-bot = discord.Bot(debug_guilds=CONFIG["GUILD_IDS"] if CONFIG["GUILD_IDS"] else None)
-
-# --- SYMBOL MAPPINGS ---
-YF_SYMBOLS = {
-    "spx": "^GSPC", "es": "^GSPC",
-    "ndx": "^NDX",  "nq": "^NDX",
-    "rut": "^RUT",  "rty": "^RUT",
-    "ym": "YM=F",   "dow": "YM=F",
-    "vix": "^VIX",  "sp": "^GSPC",
-    "spy": "SPY",   "qqq": "QQQ",
-    "iwm": "IWM",   "dia": "DIA",
-    "vixy": "VIXY", "uvxy": "UVXY",
-    "tlt": "TLT",   "hyg": "HYG"
-}
-
-IV_PROXIES = { "^GSPC": "SPY", "^NDX": "QQQ", "^RUT": "IWM" }
-
-def resolve_yf_symbol(user_input: str) -> str:
-    return YF_SYMBOLS.get(user_input.lower(), user_input.upper())
-
-def get_options_ticker(yf_sym):
-    if yf_sym == "^GSPC": return "^SPX"
-    return yf_sym
-
-def is_third_friday(date_str):
-    d = datetime.datetime.strptime(date_str, "%Y-%m-%d").date()
-    return d.weekday() == 4 and 15 <= d.day <= 21
+bot = discord.Bot(debug_guilds=None)
 
 # --- COMMAND HELPERS ---
 async def get_db_dates(ctx: discord.AutocompleteContext):
@@ -1638,7 +1637,7 @@ async def beeks_vig(
     spot = data[0]['spot']
     df = pd.DataFrame(data)
     
-    # --- FIX IS HERE (Wrap in np.array) ---
+    # --- FIX: Numpy Array wrapper ---
     unique_strikes = np.array(sorted(df['strike'].unique()))
     atm_strike = unique_strikes[np.abs(unique_strikes - spot).argmin()]
 
@@ -1727,13 +1726,26 @@ async def beeks_vig(
 async def beeks_skew(
     ctx: discord.ApplicationContext, 
     ticker: Option(str, required=True),
-    expiry: Option(str, description="YYYY-MM-DD (Optional)", required=False),
+    mode: Option(str, choices=["Intraday", "Macro"], default="Intraday", description="Intraday (0DTE/1%) or Macro (30D/5%)"),
+    expiry: Option(str, description="Override Date (YYYY-MM-DD)", required=False),
     replay_date: Option(str, description="Backtest Date", autocomplete=get_db_dates, required=False), 
     session: Option(str, description="Session Tag", autocomplete=get_db_tags, required=False)
 ):
     await ctx.defer(ephemeral=True)
     
-    # Backtest Setup
+    # --- 1. CONFIGURATION SWITCH ---
+    if mode == "Intraday":
+        scope_req = "0DTE"
+        otm_dist = 0.01   # 1% OTM for Day Trading (Immediate Sentiment)
+        dist_label = "1%"
+    else:
+        scope_req = "Front Month"
+        otm_dist = 0.05   # 5% OTM for Macro (Standard Skew Metric)
+        dist_label = "5%"
+
+    if expiry: scope_req = "Specific"
+
+    # --- 2. BACKTEST SETUP ---
     calc_date = replay_date if replay_date else None
     calc_tag = session
     if calc_date and not calc_tag:
@@ -1741,42 +1753,48 @@ async def beeks_skew(
         db_ticker = get_options_ticker(yf_sym)
         calc_tag = get_latest_tag_for_date(db_ticker, calc_date)
 
-    # Fetch
-    scope_req = "Specific" if expiry else "Front Month"
+    # --- 3. FETCH DATA ---
     data = fetch_and_enrich_chain(
         ticker=ticker, expiry_date=expiry, snapshot_date=calc_date, snapshot_tag=calc_tag, 
         scope=scope_req, range_count=9999
     )
     
     if not data:
-        await ctx.respond(f"❌ **Beeks:** 'No data available.'", ephemeral=True)
+        await ctx.respond(f"❌ **Beeks:** 'No data available for {scope_req}.'", ephemeral=True)
         return
 
     spot = data[0]['spot']
     df = pd.DataFrame(data)
 
-    # Filter Time
+    # --- 4. FILTER TIME (EXPIRY SELECTION) ---
     if expiry:
         skew_chain = df 
         target_time = df['time_year'].iloc[0]
+    elif mode == "Intraday":
+        # For Intraday, we want the nearest expiry (0DTE)
+        # Sort by time, pick smallest
+        unique_times = sorted(df['time_year'].unique())
+        target_time = unique_times[0]
+        skew_chain = df[df['time_year'] == target_time]
     else:
+        # For Macro, we want closest to 30 Days (0.082 years)
         unique_times = sorted(df['time_year'].unique())
         if not unique_times:
              await ctx.respond(f"❌ **Beeks:** 'Bad data structure.'", ephemeral=True); return
         target_time = min(unique_times, key=lambda x: abs(x - 0.082))
         skew_chain = df[df['time_year'] == target_time]
     
-    # Calculate Skew
-    put_strike_target = spot * 0.95
-    call_strike_target = spot * 1.05
+    # --- 5. CALCULATE SKEW ---
+    put_strike_target = spot * (1 - otm_dist)
+    call_strike_target = spot * (1 + otm_dist)
     
-    # --- FIX IS HERE (.str.lower()) ---
     puts = skew_chain[skew_chain['type'].str.lower() == 'put']
     calls = skew_chain[skew_chain['type'].str.lower() == 'call']
     
     if puts.empty or calls.empty:
          await ctx.respond(f"❌ **Beeks:** 'Chain too thin for Skew.'", ephemeral=True); return
 
+    # Find closest strikes to our targets
     put_row = puts.iloc[np.abs(puts['strike'] - put_strike_target).argmin()]
     call_row = calls.iloc[np.abs(calls['strike'] - call_strike_target).argmin()]
     
@@ -1786,11 +1804,15 @@ async def beeks_skew(
     if call_iv == 0: ratio = 0
     else: ratio = put_iv / call_iv
     
+    # Sentiment Logic
     sentiment = "BEARISH (HEDGING)" if ratio > 1.2 else "BULLISH (FOMO)" if ratio < 0.8 else "NEUTRAL"
+    
+    # --- 6. RENDER ---
     view_setting = get_user_terminal_setting(ctx.author.id)
     quote = random.choice(MOVIE_QUOTES)
     source = f"DB: {calc_date} [{calc_tag}]" if calc_date else "LIVE"
     dte_days = int(target_time * 365)
+    expiry_str = f"{dte_days} DTE" if dte_days > 0 else "EXPIRES TODAY"
 
     if view_setting == "modern":
         plt.figure(figsize=(10, 5))
@@ -1799,17 +1821,24 @@ async def beeks_skew(
 
         c_sent = '#ff5555' if ratio > 1.2 else '#55ff55' if ratio < 0.8 else '#ffff55'
         
-        plt.text(0.5, 0.85, f"VOLATILITY SKEW ({dte_days} DTE)", color='white', fontsize=16, weight='bold', ha='center')
-        plt.text(0.5, 0.65, f"{ratio:.2f}", color=c_sent, fontsize=36, weight='bold', ha='center')
-        plt.text(0.5, 0.55, sentiment, color=c_sent, fontsize=12, weight='bold', ha='center', bbox=dict(facecolor='#222222', edgecolor=c_sent, pad=5))
+        # Header
+        plt.text(0.5, 0.85, f"VOLATILITY SKEW ({mode.upper()})", color='white', fontsize=16, weight='bold', ha='center')
+        plt.text(0.5, 0.77, f"{expiry_str}", color='#888888', fontsize=10, weight='bold', ha='center')
         
-        plt.text(0.25, 0.35, f"PUT IV (95%)", color='#ff99cc', fontsize=10, ha='center')
-        plt.text(0.25, 0.20, f"{put_iv:.1f}%", color='white', fontsize=16, weight='bold', ha='center')
+        # The Big Number
+        plt.text(0.5, 0.55, f"{ratio:.2f}", color=c_sent, fontsize=36, weight='bold', ha='center')
+        plt.text(0.5, 0.45, sentiment, color=c_sent, fontsize=12, weight='bold', ha='center', bbox=dict(facecolor='#222222', edgecolor=c_sent, pad=5))
+        
+        # Left Side (Puts)
+        plt.text(0.20, 0.30, f"PUTS (-{dist_label})", color='#ff99cc', fontsize=10, ha='center')
+        plt.text(0.20, 0.15, f"{put_iv:.1f}%", color='white', fontsize=16, weight='bold', ha='center')
 
-        plt.text(0.75, 0.35, f"CALL IV (105%)", color='#99ccff', fontsize=10, ha='center')
-        plt.text(0.75, 0.20, f"{call_iv:.1f}%", color='white', fontsize=16, weight='bold', ha='center')
+        # Right Side (Calls)
+        plt.text(0.80, 0.30, f"CALLS (+{dist_label})", color='#99ccff', fontsize=10, ha='center')
+        plt.text(0.80, 0.15, f"{call_iv:.1f}%", color='white', fontsize=16, weight='bold', ha='center')
 
-        plt.text(0.5, 0.05, f"Ref: {spot:.2f} | {source}", color='#666666', fontsize=9, ha='center')
+        # Footer
+        plt.text(0.5, 0.05, f"{ticker.upper()} @ {spot:.2f} | {source}", color='#666666', fontsize=9, ha='center')
 
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e')
@@ -1818,8 +1847,8 @@ async def beeks_skew(
         embed = discord.Embed(description=f"**{quote}**", color=0xFF99CC); embed.set_image(url="attachment://skew.png")
         await ctx.respond(embed=embed, file=file, ephemeral=True)
     else:
-        msg = f"**{ticker.upper()} SKEW REPORT ({dte_days} DTE)**\nSource: `{source}`\n"
-        msg += f"```yaml\nPUT IV (95%):  {put_iv:.1f}%\nCALL IV (105%): {call_iv:.1f}%\nRATIO:         {ratio:.2f}\nSENTIMENT:     {sentiment}\n```"
+        msg = f"**{ticker.upper()} SKEW ({mode.upper()})**\nSource: `{source}` | {expiry_str}\n"
+        msg += f"```yaml\nPUT IV  (-{dist_label}): {put_iv:.1f}%\nCALL IV (+{dist_label}): {call_iv:.1f}%\nRATIO:         {ratio:.2f}\nSENTIMENT:     {sentiment}\n```"
         await ctx.respond(msg, ephemeral=True)
 
 @beeks.command(name="inspect", description="ADMIN: View Database Tree")
@@ -1903,4 +1932,9 @@ async def on_ready():
     print(f"🍊 Duke & Duke: Clarence Beeks is Online. Logged in as {bot.user}")
     await bot.sync_commands()
 
-bot.run(CONFIG["DISCORD_TOKEN"])
+# --- EXECUTION ---
+if TOKEN:
+    bot.run(TOKEN)
+else:
+    # PASTE YOUR TOKEN HERE IF YOU DO NOT HAVE A .ENV FILE
+    bot.run("YOUR_TOKEN_HERE")

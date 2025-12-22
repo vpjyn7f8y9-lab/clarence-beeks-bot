@@ -1903,7 +1903,7 @@ async def beeks_inspect(ctx: discord.ApplicationContext, ticker: Option(str, req
     await ctx.respond(final_msg, ephemeral=True)
 
 # --- ENSURE SCHED_TIMES IS DEFINED ---
-sched_times = [datetime.time(hour=9, minute=45), datetime.time(hour=15, minute=45)]
+sched_times = [datetime.time(hour=9, minute=45), datetime.time(hour=12), datetime.time(hour=15, minute=55)]
 
 @tasks.loop(time=sched_times)
 async def auto_fetch_heavy_chains():

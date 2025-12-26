@@ -1902,33 +1902,98 @@ async def beeks_inspect(ctx: discord.ApplicationContext, ticker: Option(str, req
         
     await ctx.respond(final_msg, ephemeral=True)
 
-# --- ENSURE SCHED_TIMES IS DEFINED ---
-sched_times = [datetime.time(hour=9, minute=45), datetime.time(hour=12), datetime.time(hour=15, minute=55)]
+# --- ROBUST SCHEDULER (FIXED TIMEZONES) ---
+from zoneinfo import ZoneInfo
+
+# 1. Define the Timezone FIRST
+ny_tz = ZoneInfo("America/New_York")
+
+# 2. Attach the Timezone to the trigger times
+# This tells the bot: "Wait until it is 9:45 in NEW YORK, not London."
+sched_times = [
+    datetime.time(hour=9, minute=45, tzinfo=ny_tz),  # OPEN
+    datetime.time(hour=12, minute=0, tzinfo=ny_tz),  # MID
+    datetime.time(hour=15, minute=55, tzinfo=ny_tz)  # CLOSE
+]
 
 @tasks.loop(time=sched_times)
 async def auto_fetch_heavy_chains():
-    now = datetime.datetime.now(ZoneInfo("America/New_York"))
-    if now.weekday() > 4: return
-    session_tag = "OPEN" if now.hour < 11 else "MID" if now.hour < 14 else "CLOSE"
-    print(f"\n⏰ AUTO-FETCH [{session_tag}]")
-    for symbol in ["^SPX", "^NDX"]:
-        try:
-            tkr = yf.Ticker(symbol); hist = tkr.history(period="1d")
-            if hist.empty: continue
-            if not validate_atm_data(tkr, hist['Close'].iloc[-1]): continue
-            full_chain = {"symbol": symbol, "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"), "expirations": {}}
-            for e in tkr.options:
-                try:
-                    opt = tkr.option_chain(e)
-                    full_chain["expirations"][e] = {"calls": opt.calls.to_dict(orient='records'), "puts": opt.puts.to_dict(orient='records')}
-                except: pass
-            save_snapshot(symbol, full_chain, hist['Close'].iloc[-1], get_current_yield(symbol), tag=session_tag, custom_timestamp=now.strftime("%Y-%m-%d %H:%M:%S"))
-        except: pass
+    try:
+        # Get 'now' in NY time to verify we are running at the right moment
+        now = datetime.datetime.now(ny_tz)
+        
+        # Skip Weekends (0=Mon ... 4=Fri)
+        if now.weekday() > 4: 
+            return
+
+        # Determine Tag based on the hour (NY Time)
+        session_tag = "OPEN" if now.hour < 11 else "MID" if now.hour < 14 else "CLOSE"
+        
+        print(f"\n⏰ AUTO-FETCH TRIGGERED [{session_tag}] at {now.strftime('%H:%M:%S')} ET")
+        
+        for symbol in ["^SPX", "^NDX"]:
+            try:
+                # print(f"   > Fetching {symbol}...") # Optional debug spam
+                tkr = yf.Ticker(symbol)
+                hist = tkr.history(period="1d")
+                
+                if hist.empty: continue
+                
+                # --- DATA VALIDATION (Prevents crashes on bad feeds) ---
+                if not validate_atm_data(tkr, hist['Close'].iloc[-1]):
+                    print(f"   ⚠️ Skipping {symbol}: Bad Data")
+                    continue
+                
+                # Create the JSON packet
+                full_chain = {"symbol": symbol, "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"), "expirations": {}}
+                
+                # Optimization: Only grab the first 6 expirations to save time/memory
+                exps = tkr.options[:6] if tkr.options else []
+                
+                for e in exps:
+                    try:
+                        opt = tkr.option_chain(e)
+                        full_chain["expirations"][e] = {
+                            "calls": opt.calls.to_dict(orient='records'), 
+                            "puts": opt.puts.to_dict(orient='records')
+                        }
+                    except: pass
+                
+                # Save it
+                save_snapshot(
+                    symbol, 
+                    full_chain, 
+                    hist['Close'].iloc[-1], 
+                    get_current_yield(symbol), 
+                    tag=session_tag, 
+                    custom_timestamp=now.strftime("%Y-%m-%d %H:%M:%S")
+                )
+                print(f"   ✅ Snapshot Saved: {symbol} [{session_tag}]")
+                
+            except Exception as e:
+                print(f"   ❌ Failed {symbol}: {e}")
+
+    except Exception as e:
+        print(f"❌ CRITICAL SCHEDULER ERROR: {e}")
+
+# 3. Wait for Bot Ready before starting timer
+@auto_fetch_heavy_chains.before_loop
+async def before_scheduler():
+    await bot.wait_until_ready()
+    print("⏰ Scheduler armed (NY Time). Waiting for trigger...")
+
+# 4. Auto-Restart if it crashes
+@auto_fetch_heavy_chains.error
+async def scheduler_error(error):
+    print(f"💀 SCHEDULER CRASHED: {error}")
+    print("🔄 Restarting Scheduler...")
+    auto_fetch_heavy_chains.restart()
 
 @bot.event
 async def on_ready():
     init_db()
-    if not auto_fetch_heavy_chains.is_running(): auto_fetch_heavy_chains.start()
+    if not auto_fetch_heavy_chains.is_running():
+        auto_fetch_heavy_chains.start()
     print(f"🍊 Duke & Duke: Clarence Beeks is Online. Logged in as {bot.user}")
     await bot.sync_commands()
 
@@ -1936,5 +2001,4 @@ async def on_ready():
 if TOKEN:
     bot.run(TOKEN)
 else:
-    # PASTE YOUR TOKEN HERE IF YOU DO NOT HAVE A .ENV FILE
     bot.run("YOUR_TOKEN_HERE")

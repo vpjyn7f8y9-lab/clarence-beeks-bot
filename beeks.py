@@ -1161,18 +1161,84 @@ async def beeks_help(
         embed.add_field(name="Interpretation", value="**Ratio > 1.2 (Bearish):** Puts are expensive. Everyone is hedging. Paradoxically, this can lead to a 'Squeeze' higher.\n**Ratio < 0.8 (Bullish):** Calls are expensive. Everyone is FOMOing. Watch out for a rug pull.", inline=False)
         await ctx.respond(embed=embed, ephemeral=True)
 
-@beeks.command(name="setmode", description="Configure Global Terminal View Settings")
-async def beeks_setmode(ctx: discord.ApplicationContext, terminal: Option(str, choices=["Modern", "Bloomberg"], required=True)):
-    set_user_terminal_setting(ctx.author.id, terminal.lower())
-    await ctx.respond(f"🌎 **Global Terminal View** set to: **{terminal.upper()}**", ephemeral=True)
+# --- DATABASE ADMIN SUITE (Subgroup: /beeks db ...) ---
 
-@beeks.command(name="snapshot", description="ADMIN: Force Download Full Chain")
+db_group = beeks.create_subgroup("db", "Database Administration Tools")
+
+@db_group.command(name="catalog", description="List all tickers and file counts")
 @commands.has_permissions(administrator=True)
-async def beeks_snapshot(
+async def db_catalog(ctx: discord.ApplicationContext):
+    await ctx.defer(ephemeral=True)
+    conn = sqlite3.connect("beeks.db")
+    c = conn.cursor()
+    c.execute("SELECT ticker, COUNT(*) FROM chain_snapshots GROUP BY ticker ORDER BY COUNT(*) DESC")
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        await ctx.respond("📭 **Database is Empty.**", ephemeral=True)
+        return
+
+    msg = "**🗄️ DATABASE CATALOG**\n```yaml\n"
+    msg += f"{'TICKER':<10} | {'SNAPSHOTS':<10}\n"
+    msg += "-"*25 + "\n"
+    for r in rows:
+        msg += f"{r[0]:<10} | {r[1]:<10}\n"
+    msg += "```"
+    await ctx.respond(msg, ephemeral=True)
+
+@db_group.command(name="inspect", description="View Snapshot Tree for a Ticker")
+@commands.has_permissions(administrator=True)
+async def db_inspect(ctx: discord.ApplicationContext, ticker: Option(str, required=True)):
+    await ctx.defer(ephemeral=True)
+    
+    yf_sym = resolve_yf_symbol(ticker)
+    db_ticker = get_options_ticker(yf_sym)
+    
+    conn = sqlite3.connect("beeks.db")
+    c = conn.cursor()
+    
+    c.execute("""
+        SELECT date(timestamp) as date_part, tag, time(timestamp) as time_part 
+        FROM chain_snapshots 
+        WHERE ticker = ? 
+        ORDER BY timestamp DESC
+    """, (db_ticker,))
+    
+    rows = c.fetchall()
+    conn.close()
+    
+    if not rows:
+        await ctx.respond(f"❌ **Beeks:** 'No records for **{db_ticker}**.'", ephemeral=True)
+        return
+
+    tree = {}
+    for r in rows:
+        d, tag, t = r
+        if d not in tree: tree[d] = []
+        tree[d].append(f"{tag} ({t})")
+    
+    lines = [f"**📂 MANIFEST: {db_ticker}**", "```yaml"]
+    for date_key in sorted(tree.keys(), reverse=True):
+        lines.append(f"{date_key}")
+        entries = tree[date_key]
+        for i, entry in enumerate(entries):
+            connector = "└─" if i == len(entries) - 1 else "├─"
+            lines.append(f"  {connector} {entry}")
+            
+    lines.append("```")
+    final_msg = "\n".join(lines)
+    if len(final_msg) > 1900: final_msg = final_msg[:1900] + "\n```... (Truncated)"
+        
+    await ctx.respond(final_msg, ephemeral=True)
+
+@db_group.command(name="snapshot", description="Force Manual Snapshot (Live Data)")
+@commands.has_permissions(administrator=True)
+async def db_snapshot(
     ctx: discord.ApplicationContext, 
     ticker: Option(str, required=True),
     session: Option(str, required=True),
-    force_date: Option(str, required=False)
+    force_date: Option(str, description="Override Date (YYYY-MM-DD)", required=False)
 ):
     await ctx.defer(ephemeral=True)
     yf_sym = get_options_ticker(resolve_yf_symbol(ticker))
@@ -1205,14 +1271,77 @@ async def beeks_snapshot(
         else: await ctx.respond(f"❌ **Beeks:** 'Duplicate Tag.'", ephemeral=True)
     except Exception as e: await ctx.respond(f"⚠️ **Beeks:** 'Snapshot failed: {e}'", ephemeral=True)
 
-@beeks.command(name="delete_snapshot", description="ADMIN: Permanently remove a snapshot")
+@db_group.command(name="delete", description="Delete a single snapshot file")
 @commands.has_permissions(administrator=True)
-async def beeks_delete_snapshot(ctx: discord.ApplicationContext, ticker: str, replay_date: str, session: str):
+async def db_delete(
+    ctx: discord.ApplicationContext, 
+    ticker: str, 
+    replay_date: Option(str, autocomplete=get_db_dates), 
+    session: Option(str, autocomplete=get_db_tags)
+):
     await ctx.defer(ephemeral=True)
     yf_sym = get_options_ticker(resolve_yf_symbol(ticker))
     if delete_snapshot_from_db(yf_sym, replay_date, session):
         await ctx.respond(f"🗑️ **Beeks:** 'Shredded file for **{yf_sym}** on **{replay_date}** [{session}].'", ephemeral=True)
     else: await ctx.respond(f"❌ **Beeks:** 'File not found.'", ephemeral=True)
+
+@db_group.command(name="purge", description="⚠️ NUKE ALL data for a specific ticker")
+@commands.has_permissions(administrator=True)
+async def db_purge(ctx: discord.ApplicationContext, ticker: Option(str, required=True)):
+    yf_sym = resolve_yf_symbol(ticker)
+    db_ticker = get_options_ticker(yf_sym)
+    
+    await ctx.defer(ephemeral=True)
+    conn = sqlite3.connect("beeks.db")
+    c = conn.cursor()
+    
+    c.execute("DELETE FROM chain_snapshots WHERE ticker = ?", (db_ticker,))
+    snap_count = c.rowcount
+    c.execute("DELETE FROM market_data WHERE ticker = ?", (yf_sym,))
+    cache_count = c.rowcount
+    
+    conn.commit()
+    conn.close()
+    
+    if snap_count == 0 and cache_count == 0:
+         await ctx.respond(f"❌ **Beeks:** 'No data found for **{db_ticker}**.'", ephemeral=True)
+    else:
+         await ctx.respond(f"🗑️ **Beeks:** 'Purged **{snap_count}** snapshots and **{cache_count}** cache files for **{db_ticker}**.'", ephemeral=True)
+
+@db_group.command(name="prune", description="Clean Up: Delete OLD Open/Mid snapshots. Keep CLOSE.")
+@commands.has_permissions(administrator=True)
+async def db_prune(
+    ctx: discord.ApplicationContext, 
+    ticker: Option(str, description="Ticker (or 'ALL')", required=True),
+    days: Option(int, description="Delete Intraday older than X days", default=7)
+):
+    await ctx.defer(ephemeral=True)
+    
+    cutoff_date = (datetime.datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+    target_ticker = None if ticker.upper() == "ALL" else get_options_ticker(resolve_yf_symbol(ticker))
+    
+    conn = sqlite3.connect("beeks.db")
+    c = conn.cursor()
+    
+    query = "DELETE FROM chain_snapshots WHERE tag != 'CLOSE' AND date(timestamp) < ?"
+    params = [cutoff_date]
+    
+    if target_ticker:
+        query += " AND ticker = ?"
+        params.append(target_ticker)
+        
+    c.execute(query, tuple(params))
+    deleted_count = c.rowcount
+    conn.commit()
+    conn.close()
+    
+    scope_str = f"**{target_ticker}**" if target_ticker else "**ALL TICKERS**"
+    await ctx.respond(f"🧹 **Beeks:** 'Cleaned up {scope_str}. Deleted **{deleted_count}** Open/Mid files older than {days} days. (CLOSE files preserved).'", ephemeral=True)
+
+@beeks.command(name="setmode", description="Configure Global Terminal View Settings")
+async def beeks_setmode(ctx: discord.ApplicationContext, terminal: Option(str, choices=["Modern", "Bloomberg"], required=True)):
+    set_user_terminal_setting(ctx.author.id, terminal.lower())
+    await ctx.respond(f"🌎 **Global Terminal View** set to: **{terminal.upper()}**", ephemeral=True)
 
 @beeks.command(name="dailyrange", description="Get Volatility Ranges")
 async def beeks_dailyrange(
@@ -1851,65 +1980,13 @@ async def beeks_skew(
         msg += f"```yaml\nPUT IV  (-{dist_label}): {put_iv:.1f}%\nCALL IV (+{dist_label}): {call_iv:.1f}%\nRATIO:         {ratio:.2f}\nSENTIMENT:     {sentiment}\n```"
         await ctx.respond(msg, ephemeral=True)
 
-@beeks.command(name="inspect", description="ADMIN: View Database Tree")
-@commands.has_permissions(administrator=True)
-async def beeks_inspect(ctx: discord.ApplicationContext, ticker: Option(str, required=True)):
-    await ctx.defer(ephemeral=True)
-    
-    yf_sym = resolve_yf_symbol(ticker)
-    db_ticker = get_options_ticker(yf_sym)
-    
-    conn = sqlite3.connect("beeks.db")
-    c = conn.cursor()
-    
-    # Get all snapshots for this ticker
-    c.execute("""
-        SELECT date(timestamp) as date_part, tag, time(timestamp) as time_part 
-        FROM chain_snapshots 
-        WHERE ticker = ? 
-        ORDER BY timestamp DESC
-    """, (db_ticker,))
-    
-    rows = c.fetchall()
-    conn.close()
-    
-    if not rows:
-        await ctx.respond(f"❌ **Beeks:** 'No records found for **{db_ticker}**.'", ephemeral=True)
-        return
-
-    # Build the Tree
-    tree = {}
-    for r in rows:
-        d, tag, t = r
-        if d not in tree: tree[d] = []
-        tree[d].append(f"{tag} ({t})")
-    
-    # Format the Output
-    lines = [f"**📂 DATABASE MANIFEST: {db_ticker}**", "```yaml"]
-    
-    for date_key in sorted(tree.keys(), reverse=True):
-        lines.append(f"{date_key}")
-        entries = tree[date_key]
-        for i, entry in enumerate(entries):
-            connector = "└─" if i == len(entries) - 1 else "├─"
-            lines.append(f"  {connector} {entry}")
-            
-    lines.append("```")
-    
-    final_msg = "\n".join(lines)
-    if len(final_msg) > 1900:
-        final_msg = final_msg[:1900] + "\n```... (Truncated)"
-        
-    await ctx.respond(final_msg, ephemeral=True)
-
-# --- ROBUST SCHEDULER (FIXED TIMEZONES) ---
+# --- ROBUST SCHEDULER (FIXED TIMEZONES & SPX ONLY) ---
 from zoneinfo import ZoneInfo
 
 # 1. Define the Timezone FIRST
 ny_tz = ZoneInfo("America/New_York")
 
 # 2. Attach the Timezone to the trigger times
-# This tells the bot: "Wait until it is 9:45 in NEW YORK, not London."
 sched_times = [
     datetime.time(hour=9, minute=45, tzinfo=ny_tz),  # OPEN
     datetime.time(hour=12, minute=0, tzinfo=ny_tz),  # MID
@@ -1931,15 +2008,15 @@ async def auto_fetch_heavy_chains():
         
         print(f"\n⏰ AUTO-FETCH TRIGGERED [{session_tag}] at {now.strftime('%H:%M:%S')} ET")
         
-        for symbol in ["^SPX", "^NDX"]:
+        # --- CHANGE: REMOVED NDX, NOW SPX ONLY ---
+        for symbol in ["^SPX"]:
             try:
-                # print(f"   > Fetching {symbol}...") # Optional debug spam
                 tkr = yf.Ticker(symbol)
                 hist = tkr.history(period="1d")
                 
                 if hist.empty: continue
                 
-                # --- DATA VALIDATION (Prevents crashes on bad feeds) ---
+                # --- DATA VALIDATION ---
                 if not validate_atm_data(tkr, hist['Close'].iloc[-1]):
                     print(f"   ⚠️ Skipping {symbol}: Bad Data")
                     continue
@@ -1947,7 +2024,7 @@ async def auto_fetch_heavy_chains():
                 # Create the JSON packet
                 full_chain = {"symbol": symbol, "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"), "expirations": {}}
                 
-                # Optimization: Only grab the first 6 expirations to save time/memory
+                # Optimization: Only grab the first 6 expirations
                 exps = tkr.options[:6] if tkr.options else []
                 
                 for e in exps:

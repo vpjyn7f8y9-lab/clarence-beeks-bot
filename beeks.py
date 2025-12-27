@@ -692,16 +692,85 @@ async def get_db_tags(ctx: discord.AutocompleteContext):
 beeks = bot.create_group("beeks", "Official Dukes Bros. Fixer")
 
 @beeks.command(name="help", description="Learn how to use Beeks")
-async def beeks_help(ctx: discord.ApplicationContext, topic: Option(str, name="topic", choices=["chain", "dailyrange", "dailylevels", "dom_flip", "dom_exposures"])):
-    embed = discord.Embed(color=0xFFFFFF)
-    if topic == "chain":
-        embed.title="📘 Manual: The Chain"; embed.description="**Raw Data Feed (DOM Style)**\nView the raw Option Chain data sorted High Strikes to Low."
-    elif topic == "dailyrange":
-        embed.title="📘 Manual: Daily Range"; embed.description="**Intraday Volatility Bands**\n🟦 Valentine: Expected Range (IV)\n🟧 Winthorpe: Historical Deviation (HV)"
-    elif topic == "dailylevels":
-        embed.title="📘 Manual: Daily Levels"; embed.description="**Structural Pins**\nVisualizes DEX (Walls), GEX (Magnets), VEX (Speed), CEX (Decay) per strike."
-    elif topic == "dom_exposures":
-        embed.title="📘 Manual: Exposures"; embed.description="**Dealer Positioning (Big 3)**\nShows Total Market Exposure for GEX, DEX, and VEX."
+async def beeks_help(
+    ctx: discord.ApplicationContext, 
+    command: Option(str, description="Select a command for detailed manual", choices=["chain", "dailyrange", "dailylevels", "dom_flip", "dom_exposures", "dom_vig", "dom_skew", "setmode"], required=False)
+):
+    embed = discord.Embed(color=0xFFA500) # Duke & Duke Orange
+    
+    # --- GENERAL HELP (Default) ---
+    if not command:
+        embed.title = "🍊 Clarence Beeks: The Duke & Duke Fixer"
+        embed.description = "**Institutional Market Structure & Volatility Analytics**\n\nI don't guess. I calculate. This terminal provides live option chain analysis, dealer positioning (GEX/DEX), and statistical volatility ranges to find the 'Structural Pins' in the market."
+        
+        # Explain the Engine (Data Logic)
+        embed.add_field(
+            name="⛽️ The Fuel (Data)", 
+            value=(
+                "**1. Live First:** I always attempt to fetch live data from the floor (Yahoo) first.\n"
+                "**2. Daily Range only:** If the live feed is dark, I auto-load the last saved snapshot if one exists.\n"
+                "**3. Time:** All analysis is strictly **New York Time (ET)**."
+            ), 
+            inline=False
+        )
+        
+        # The Toolset Summary
+        embed.add_field(
+            name="🧰 The Toolset", 
+            value=(
+                "**/beeks dailyrange:** Intraday Volatility Bands as Standard Deviations.\n"
+                "**/beeks dailylevels:** Dealer Exposure By Strike (DEX/GEX/VEX/CEX).\n"
+                "**/beeks dom:** Deep Market Structure (exposures, flip, skew, vig).\n"
+            ), 
+            inline=False
+        )
+        embed.set_footer(text="Tip: Type '/beeks help [command]' for specific command descriptions.")
+        await ctx.respond(embed=embed, ephemeral=True)
+        return
+
+    # --- SPECIFIC COMMAND HELP ---
+    if command == "chain":
+        embed.title="📘 Manual: The Chain"
+        embed.description="**Raw Data Feed (DOM Style)**\nView the raw Option Chain data. Unlike Yahoo, we sort High Strikes at the top (Standard DOM view) to match your trading platform."
+        embed.add_field(name="Features", value="**Backtesting:** Request a chain from any date in the DB.\n**The Greeks:** Full breakdown of Delta, Gamma, Theta, and IV per strike.", inline=False)
+        
+    elif command == "dailyrange":
+        embed.title="📘 Manual: Daily Range"
+        embed.description="**Intraday Volatility Bands**\nWe don't guess where price is going. We calculate where it *should* stop based on Energy and History."
+        embed.add_field(name="The Levels", value="**🟦 Valentine:** Expected Range.\n**🟧 Winthorpe:** Historical Deviation.\n**⬜ Reference:** Todays Open (if Market 0pen) or previous close during after hours.", inline=False)
+        embed.add_field(name="Resiliency", value="**Auto-Fallback:** If live data fails, this command will automatically load the last known good data from the DB.", inline=False)
+
+    elif command == "dailylevels":
+        embed.title="📘 Manual: Daily Levels"
+        embed.description="**Intraday Structural Pins**\nVisualizes the net Dealer Exposure per strike. These are the walls the market must fight through."
+        embed.add_field(name="Metrics", value="**DEX (Delta):** Directional Risk (The Walls).\n**GEX (Gamma):** Stability (The Magnets).\n**VEX (Vanna):** Volatility Sensitivity (The Gas Pedal).\n**CEX (Charm):** Time Decay (The 2:00pm Flush).", inline=False)
+        embed.add_field(name="Confluence", value="Use `metric:CONFLUENCE` to find strikes where multiple Greeks overlap. These are the strongest levels on the board.", inline=False)
+
+    elif command == "dom_exposures":
+        embed.title="📘 Manual: Exposures"
+        embed.description="**Total Dealer Positioning (The Big 3)**\nShows the Net GEX, DEX, and VEX for the entire market scope. Use this to determine the broader regime."
+        embed.add_field(name="Interpretation", value="**Positive GEX:** Dampened Volatility (Buy the dip, Sell the rip).\n**Negative GEX:** Accelerated Volatility (Trend days).\n**Vanna (VEX):** If high, market moves aggressively when IV drops.", inline=False)
+
+    elif command == "dom_flip":
+        embed.title="📘 Manual: Gamma Flip"
+        embed.description="**The Zero Gamma Level**\nThe theoretical price level where Dealers flip from Long Gamma (Stable) to Short Gamma (Volatile)."
+        embed.add_field(name="Strategy", value="**Above Flip:** Market tends to be stable.\n**Below Flip:** Market tends to be volatile/directional.\n", inline=False)
+
+    elif command == "dom_vig":
+        embed.title="📘 Manual: The Vig"
+        embed.description="**Expected Move (ATM Straddle)**\nCalculates the cost of the At-The-Money Straddle. This is the 'Vig' (fee) Market Makers are charging to play the game."
+        embed.add_field(name="How To Use", value="**Cost:** This is the breakeven distance.\n**Breakevens:** The upper and lower bounds where the 'House' starts losing money.", inline=False)
+
+    elif command == "dom_skew":
+        embed.title="📘 Manual: Skew"
+        embed.description="**Sentiment Detector (Put/Call Ratio)**\nCompares the cost of OTM Puts (Downside Protection) vs OTM Calls (Upside FOMO)."
+        embed.add_field(name="Modes", value="**Intraday:** Checks 0DTE Skew (1% OTM). Immediate sentiment.\n**Macro:** Checks 30-Day Skew (5% OTM). Hedging sentiment.", inline=False)
+
+    elif command == "setmode":
+        embed.title="📘 Manual: Set Mode"
+        embed.description="**Global Terminal View**\nConfigure how the bot delivers data to you."
+        embed.add_field(name="Options", value="**Modern:** Generates visual charts and PNG dashboards. (Best for Desktop)\n**Bloomberg:** Returns raw text and ASCII tables. (Best for Mobile/Low Data)", inline=False)
+
     await ctx.respond(embed=embed, ephemeral=True)
 
 @beeks.command(name="setmode", description="Configure Global Terminal View Settings")
@@ -778,7 +847,7 @@ async def beeks_dailylevels(
 
     await ctx.interaction.edit_original_response(content=f"⏳ **Beeks:** 'Mapping {metric}...'")
     raw_data = fetch_and_enrich_chain(ticker=ticker, expiry_date=target_date, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope, range_count=9999)
-    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'No data found.'"); return
+    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'"); return
     
     spot_price = raw_data[0]['spot']; strike_data = calculate_strike_exposures(raw_data, spot_price, display_ticker)
     
@@ -813,7 +882,7 @@ async def beeks_chain(ctx: discord.ApplicationContext, ticker: Option(str, requi
     calc_date = replay_date if replay_date else None; calc_tag = session; 
     if calc_date and not calc_tag: calc_tag = get_latest_tag_for_date(display_ticker, calc_date)
     data = fetch_and_enrich_chain(ticker=ticker, expiry_date=expiry, snapshot_date=calc_date, snapshot_tag=calc_tag, scope="Specific" if expiry else "Front Month", range_count=actual_rows, pivot=center)
-    if not data: await ctx.respond(f"❌ **Beeks:** 'No data found.'", ephemeral=True); return
+    if not data: await ctx.respond(f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'", ephemeral=True); return
     spot = data[0]['spot']; target_date = expiry if expiry else "FRONT MONTH"; view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES); source_label = f"DB: {calc_date} [{calc_tag}]" if calc_date else "LIVE"
     closest_strike = min([d['strike'] for d in data], key=lambda x: abs(x - spot))
     table_rows = []; grouped = {}
@@ -871,7 +940,7 @@ async def dom_flip(ctx: discord.ApplicationContext, ticker: Option(str, required
     else: status_msg = f"⏳ **Beeks:** 'Scanning {scope}...'"; target_date = None
     await ctx.interaction.edit_original_response(content=status_msg)
     raw_data = fetch_and_enrich_chain(ticker=ticker, expiry_date=target_date, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope)
-    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'No data found.'"); return
+    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'"); return
     spot_price = raw_data[0].get('spot') or yf.Ticker(yf_sym).history(period="1d")['Close'].iloc[-1]; flip_price, plot_data = calculate_gamma_flip(raw_data, spot_price)
     view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
     if view_setting == 'modern' and plot_data:
@@ -893,7 +962,7 @@ async def dom_vig(ctx: discord.ApplicationContext, ticker: Option(str, required=
     if calc_date and not calc_tag: yf_sym = resolve_yf_symbol(ticker); db_ticker = get_options_ticker(yf_sym); calc_tag = get_latest_tag_for_date(db_ticker, calc_date)
     scope = "Specific" if expiry else "0DTE"
     data = fetch_and_enrich_chain(ticker=ticker, expiry_date=expiry, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope, range_count=9999)
-    if not data: await ctx.respond(f"❌ **Beeks:** 'No data found for {ticker}.'", ephemeral=True); return
+    if not data: await ctx.respond(f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'", ephemeral=True); return
     spot = data[0]['spot']; df = pd.DataFrame(data); unique_strikes = np.array(sorted(df['strike'].unique())); atm_strike = unique_strikes[np.abs(unique_strikes - spot).argmin()]
     atm_opts = df[df['strike'] == atm_strike]; call = atm_opts[atm_opts['type'].str.lower() == 'call']; put = atm_opts[atm_opts['type'].str.lower() == 'put']
     if call.empty or put.empty: await ctx.respond(f"❌ **Beeks:** 'ATM Straddle incomplete for {atm_strike}.'", ephemeral=True); return
@@ -927,7 +996,7 @@ async def dom_skew(ctx: discord.ApplicationContext, ticker: Option(str, required
     calc_date = replay_date if replay_date else None; calc_tag = session
     if calc_date and not calc_tag: yf_sym = resolve_yf_symbol(ticker); db_ticker = get_options_ticker(yf_sym); calc_tag = get_latest_tag_for_date(db_ticker, calc_date)
     data = fetch_and_enrich_chain(ticker=ticker, expiry_date=expiry, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope_req, range_count=9999)
-    if not data: await ctx.respond(f"❌ **Beeks:** 'No data available for {scope_req}.'", ephemeral=True); return
+    if not data: await ctx.respond(f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'", ephemeral=True); return
     spot = data[0]['spot']; df = pd.DataFrame(data)
     if expiry: skew_chain = df; target_time = df['time_year'].iloc[0]
     elif mode == "Intraday": unique_times = sorted(df['time_year'].unique()); target_time = unique_times[0]; skew_chain = df[df['time_year'] == target_time]
@@ -967,7 +1036,7 @@ async def dom_exposures(ctx: discord.ApplicationContext, ticker: Option(str, req
     else: status_msg = f"⏳ **Beeks:** 'Scanning {scope}...'"; target_date = None
     await ctx.interaction.edit_original_response(content=status_msg)
     raw_data = fetch_and_enrich_chain(ticker=ticker, expiry_date=target_date, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope, range_count=9999)
-    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'No data found.'"); return
+    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'"); return
     spot_price = raw_data[0]['spot']; gex, dex, vex = calculate_market_exposures(raw_data, spot_price)
     view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
     if view_setting == 'modern':

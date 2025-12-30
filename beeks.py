@@ -354,25 +354,30 @@ def fetch_and_enrich_chain(ticker, expiry_date, snapshot_date=None, snapshot_tag
     # --- LIVE DATA ---
     else:
         try:
+            # 1. Get Price History (Keep using the Index ^GSPC)
             tkr = yf.Ticker(yf_sym)
             hist = tkr.history(period="1d")
             if hist.empty: return None
             S = hist['Close'].iloc[-1]
             q = get_current_yield(yf_sym)
 
-            # --- GATEKEEPER VALIDATION ---
-            if not validate_atm_data(tkr, S): return None
-            
+            # 2. DETERMINING THE SEARCH TICKER (MOVED UP)
             search_tkr = tkr
             if yf_sym == "^GSPC":
                  try: 
-                     spx = yf.Ticker("^SPX"); 
-                     if spx.options: search_tkr = spx
+                     spx = yf.Ticker("^SPX")
+                     # We just blindly trust ^SPX is the one we want if ^GSPC is input
+                     search_tkr = spx
                  except: pass
 
-            all_exps = search_tkr.options
-            if not all_exps: return None
+            # 3. GATEKEEPER VALIDATION (Now using search_tkr)
+            if not validate_atm_data(search_tkr, S): 
+                print(f"DEBUG: Validation failed on {search_tkr.ticker}")
+                return None
             
+            # 4. Fetch Options
+            all_exps = search_tkr.options
+            if not all_exps: return None            
             target_exps = []
             now = datetime.datetime.now()
             
@@ -1144,7 +1149,7 @@ async def auto_fetch_heavy_chains():
                 if hist.empty: continue
                 if not validate_atm_data(tkr, hist['Close'].iloc[-1]): print(f"   ⚠️ Skipping {symbol}: Bad Data"); continue
                 full_chain = {"symbol": symbol, "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"), "expirations": {}}
-                exps = tkr.options[:6] if tkr.options else []
+                exps = tkr.options
                 for e in exps:
                     try:
                         opt = tkr.option_chain(e); full_chain["expirations"][e] = {"calls": opt.calls.to_dict(orient='records'), "puts": opt.puts.to_dict(orient='records')}

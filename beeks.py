@@ -94,6 +94,7 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS market_data (ticker TEXT PRIMARY KEY, data_json TEXT, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP)''')
     c.execute('''CREATE TABLE IF NOT EXISTS chain_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, ticker TEXT, tag TEXT, anchor_price REAL, dividend_yield REAL, timestamp DATETIME DEFAULT CURRENT_TIMESTAMP, data_json TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS user_settings (user_id INTEGER, setting_key TEXT, setting_value TEXT, PRIMARY KEY (user_id, setting_key))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS price_history (ticker TEXT, date TEXT, close REAL, PRIMARY KEY (ticker, date))''')
     conn.commit()
     conn.close()
     print("DEBUG: Database initialized (beeks.db).")
@@ -190,17 +191,28 @@ def validate_atm_data(tkr, current_price):
     try:
         exps = tkr.options
         if not exps: return False
-        chain = tkr.option_chain(exps[0])
+        
+        ny_now = datetime.datetime.now(ZoneInfo("America/New_York"))
+        today_str = ny_now.strftime("%Y-%m-%d")
+        market_closed = ny_now.hour >= 16 or ny_now.weekday() >= 5
+        
+        target_exp = None
+        for e in exps:
+            # Skip today if market is closed
+            if e == today_str and market_closed: continue
+            if datetime.datetime.strptime(e, "%Y-%m-%d").date() < ny_now.date(): continue
+            target_exp = e; break
+            
+        if not target_exp: return False
+
+        chain = tkr.option_chain(target_exp)
         df = pd.concat([chain.calls, chain.puts])
         if df.empty: return False
+        
         df['distance'] = abs(df['strike'] - current_price)
         atm_opts = df.sort_values('distance').head(4)
-        if len(atm_opts) < 4: return False
-        valid_count = len(atm_opts[atm_opts['impliedVolatility'] > 0.001])
-        return valid_count >= 3
-    except Exception as e:
-        print(f"DEBUG: Validation failed: {e}")
-        return False
+        return len(atm_opts[atm_opts['impliedVolatility'] > 0.001]) >= 3
+    except: return False
 
 def get_current_yield(ticker):
     try:
@@ -233,77 +245,198 @@ def get_next_market_date(current_dt):
         next_market_date += timedelta(days=(7 - next_market_date.weekday()))
     return next_market_date.strftime("%Y-%m-%d")
 
+def calculate_max_pain(chain_data):
+    if not chain_data: return 0
+    # Convert list of dicts to DataFrame
+    df = pd.DataFrame(chain_data)
+    if df.empty: return 0
+    
+    # Filter for relevant strikes (with OI)
+    relevant_strikes = sorted(df[df['oi'] > 0]['strike'].unique())
+    if not relevant_strikes: return 0
+    
+    # Calculate cash value of all options at each potential strike settlement
+    cash_values = {}
+    for simulation_price in relevant_strikes:
+        total_payout = 0
+        
+        # Call Payouts: max(0, SimPrice - Strike) * OI
+        calls = df[df['type'].str.lower() == 'call']
+        call_payouts = (simulation_price - calls['strike']).clip(lower=0) * calls['oi']
+        total_payout += call_payouts.sum()
+        
+        # Put Payouts: max(0, Strike - SimPrice) * OI
+        puts = df[df['type'].str.lower() == 'put']
+        put_payouts = (puts['strike'] - simulation_price).clip(lower=0) * puts['oi']
+        total_payout += put_payouts.sum()
+        
+        cash_values[simulation_price] = total_payout
+        
+    # Max Pain is the strike with the MINIMUM payout
+    return min(cash_values, key=cash_values.get)
+
+def update_price_history(ticker):
+    yf_sym = resolve_yf_symbol(ticker)
+    conn = sqlite3.connect("beeks.db"); c = conn.cursor()
+    c.execute("SELECT MAX(date) FROM price_history WHERE ticker = ?", (yf_sym,))
+    last_date = c.fetchone()[0]
+    
+    # If we have data, only fetch what's missing. If empty, fetch 5 years.
+    start_date = (datetime.datetime.strptime(last_date, "%Y-%m-%d") + datetime.timedelta(days=1)).strftime("%Y-%m-%d") if last_date else None
+    
+    try:
+        if start_date: data = yf.download(yf_sym, start=start_date, progress=False)
+        else: data = yf.download(yf_sym, period="5y", progress=False)
+        
+        if not data.empty:
+            if isinstance(data.columns, pd.MultiIndex): data = data.xs(yf_sym, axis=1, level=1, drop_level=True) if yf_sym in data.columns.levels[1] else data
+            for dt, row in data.iterrows():
+                try: c.execute("INSERT OR IGNORE INTO price_history (ticker, date, close) VALUES (?, ?, ?)", (yf_sym, dt.strftime("%Y-%m-%d"), row['Close']))
+                except: pass
+            conn.commit(); print(f"DEBUG: History updated for {yf_sym}")
+    except: pass
+    conn.close()
+
+def get_hv_from_history(ticker, days=30, target_date=None):
+    yf_sym = resolve_yf_symbol(ticker)
+    conn = sqlite3.connect("beeks.db"); c = conn.cursor()
+    query = "SELECT close FROM price_history WHERE ticker = ?"
+    params = [yf_sym]
+    if target_date: query += " AND date <= ?"; params.append(target_date)
+    query += " ORDER BY date DESC LIMIT ?"
+    params.append(days + 1)
+    
+    c.execute(query, tuple(params)); rows = c.fetchall(); conn.close()
+    if len(rows) < days + 1: return None
+    
+    prices = pd.Series([r[0] for r in rows][::-1])
+    returns = np.log(prices / prices.shift(1)).dropna()
+    hv = returns.std() * np.sqrt(252)
+    return hv if not np.isnan(hv) and hv != 0 else None
+
 # --- CORE LOGIC ---
 def fetch_market_data(ticker):
     yf_sym = resolve_yf_symbol(ticker)
-    today = datetime.date.today()
-    today_str = today.strftime("%Y-%m-%d")
     
+    # 1. Update History & Calc HV Locally
+    update_price_history(yf_sym)
+    hv_annual = get_hv_from_history(yf_sym, days=30)
+    if hv_annual is None: return None
+    
+    # 2. Fetch Live Data
     try:
         tkr = yf.Ticker(yf_sym)
-        hist = tkr.history(period="3mo") 
-        if hist.empty: return None 
+        hist = tkr.history(period="1d")
+        if hist.empty: return None
         
+        # --- NEW ANCHOR LOGIC ---
+        ny_now = datetime.datetime.now(ZoneInfo("America/New_York"))
         last_row = hist.iloc[-1]
-        is_market_open = (last_row.name.date() == today)
-        anchor_price = last_row['Open'] if is_market_open else last_row['Close']
+        last_date = last_row.name.date()
+        today = ny_now.date()
         
-        returns = np.log(hist['Close'] / hist['Close'].shift(1)).dropna().tail(30)
-        hv_annual = returns.std() * np.sqrt(252)
-        if np.isnan(hv_annual) or hv_annual == 0: return None 
+        # Default to CLOSE (for yesterday/old data)
+        anchor_price = last_row['Close']
+        anchor_type = "PREV CLOSE"
         
-        iv_annual = hv_annual 
-        try:
-            search_tkr = tkr
-            if yf_sym == "^GSPC":
-                try: 
-                    spx = yf.Ticker("^SPX")
-                    if spx.options: search_tkr = spx
-                except: pass
-            
-            if not validate_atm_data(search_tkr, anchor_price): pass
+        # If data is from TODAY
+        if last_date == today:
+            # If market is ACTIVE (Before 4:15 PM to account for settlement delay)
+            if ny_now.hour < 16 or (ny_now.hour == 16 and ny_now.minute < 15):
+                anchor_price = last_row['Open']
+                anchor_type = "OPEN"
             else:
-                all_exps = search_tkr.options
-                valid_exps = [e for e in all_exps if (datetime.datetime.strptime(e, "%Y-%m-%d").date() - today).days >= 30]
-                target_exp = None
-                for exp in valid_exps:
-                    if is_third_friday(exp): target_exp = exp; break
-                if not target_exp and valid_exps: target_exp = valid_exps[0]
-                
-                if target_exp:
-                    chain = search_tkr.option_chain(target_exp)
-                    calls = chain.calls.copy(); calls['type'] = 'C'
-                    puts = chain.puts.copy(); puts['type'] = 'P'
-                    calls['abs_diff'] = abs(calls['strike'] - anchor_price)
-                    puts['abs_diff'] = abs(puts['strike'] - anchor_price)
-                    all_opts = pd.concat([calls, puts]).sort_values('abs_diff')
-                    valid_opts = all_opts[all_opts['impliedVolatility'] > 0].head(4)
-                    if not valid_opts.empty:
-                        avg_iv = valid_opts['impliedVolatility'].mean()
-                        if 0.01 < avg_iv < 5.0: iv_annual = avg_iv
-        except: pass
+                # Market is CLOSED. Switch anchor to CLOSE for next-day prep.
+                anchor_price = last_row['Close']
+                anchor_type = "CLOSE"
+        # ------------------------
 
-        packet = {"date": today_str, "ticker": yf_sym, "anchor_price": anchor_price, "iv": iv_annual, "hv": hv_annual, "date_obj": last_row.name}
-        save_to_db(yf_sym, packet)
-        return packet
-    except: 
-        return load_from_db(yf_sym)
+        search_tkr = tkr
+        if yf_sym == "^GSPC":
+             try: 
+                 spx = yf.Ticker("^SPX")
+                 if spx.options: search_tkr = spx
+             except: pass
+
+        # Find expiry >= 30 Days
+        all_exps = search_tkr.options
+        valid_exps = [e for e in all_exps if (datetime.datetime.strptime(e, "%Y-%m-%d").date() - today).days >= 30]
+        
+        target_exp = None
+        for exp in valid_exps:
+            if is_third_friday(exp): target_exp = exp; break
+        if not target_exp and valid_exps: target_exp = valid_exps[0]
+        
+        if not target_exp: return None 
+
+        if validate_atm_data(search_tkr, anchor_price):
+             chain = search_tkr.option_chain(target_exp)
+             calls = chain.calls; puts = chain.puts
+             if not calls.empty and not puts.empty:
+                 calls['abs_diff'] = abs(calls['strike'] - anchor_price)
+                 puts['abs_diff'] = abs(puts['strike'] - anchor_price)
+                 valid_opts = pd.concat([calls, puts]).sort_values('abs_diff').head(4)
+                 
+                 avg_iv = valid_opts[valid_opts['impliedVolatility'] > 0.001]['impliedVolatility'].mean()
+                 if 0.01 < avg_iv < 5.0:
+                     return {
+                         "ticker": yf_sym, 
+                         "anchor_price": anchor_price, 
+                         "anchor_type": anchor_type, # <--- NEW TAG
+                         "iv": avg_iv, 
+                         "hv": hv_annual, 
+                         "date_obj": last_row.name
+                     }
+
+    except: pass
+    return None
 
 def fetch_historical_data(ticker, date_str, tag):
-    db_ticker = get_options_ticker(ticker)
-    try:
-        conn = sqlite3.connect("beeks.db")
-        c = conn.cursor()
-        c.execute("SELECT data_json FROM chain_snapshots WHERE ticker = ? AND date(timestamp) = ? AND tag = ? ORDER BY id DESC LIMIT 1", (db_ticker, date_str, tag))
-        row = c.fetchone()
-        conn.close()
-        if not row: return None
-        snapshot = json.loads(row[0])
-        anchor_price = snapshot.get('anchor_price')
-        if not anchor_price: return None
+    db_ticker = get_options_ticker(ticker); yf_sym = resolve_yf_symbol(ticker)
+    conn = sqlite3.connect("beeks.db"); c = conn.cursor()
+    c.execute("SELECT data_json, timestamp, anchor_price FROM chain_snapshots WHERE ticker = ? AND date(timestamp) = ? AND tag = ? ORDER BY id DESC LIMIT 1", (db_ticker, date_str, tag))
+    row = c.fetchone(); conn.close()
+    if not row: return None
+    
+    snapshot = json.loads(row[0])
+    anchor_price = row[2] if row[2] else snapshot.get('anchor_price')
+    
+    # 1. Calc True Historical HV
+    update_price_history(yf_sym)
+    hv_annual = get_hv_from_history(yf_sym, days=30, target_date=date_str)
+    if hv_annual is None: return None
 
-        return {"date": date_str, "ticker": ticker, "anchor_price": anchor_price, "iv": 0.15, "hv": 0.15, "saved_at": snapshot['timestamp'], "is_backtest": True}
-    except: return None
+    # 2. Calc True Historical IV from Snapshot
+    try: snap_ts = datetime.datetime.strptime(row[1], "%Y-%m-%d %H:%M:%S")
+    except: snap_ts = datetime.datetime.fromisoformat(row[1])
+    
+    iv_annual = None
+    exps = sorted(snapshot['expirations'].keys())
+    target_exp = None
+    
+    # Find expiry >= 30 days
+    for e in exps:
+        if (datetime.datetime.strptime(e, "%Y-%m-%d") - snap_ts).days >= 30:
+            if is_third_friday(e): target_exp = e; break
+    
+    if not target_exp: # Fallback to any >= 30 if no monthly
+         for e in exps:
+             if (datetime.datetime.strptime(e, "%Y-%m-%d") - snap_ts).days >= 30: target_exp = e; break
+             
+    if target_exp:
+        chain = snapshot['expirations'][target_exp]
+        df = pd.concat([pd.DataFrame(chain['calls']), pd.DataFrame(chain['puts'])])
+        if 'impliedVolatility' in df.columns:
+            df['iv'] = pd.to_numeric(df['impliedVolatility'], errors='coerce')
+            df['strike'] = pd.to_numeric(df['strike'], errors='coerce')
+            df['dist'] = abs(df['strike'] - anchor_price)
+            valid_opts = df[(df['iv'] > 0.001) & (df['dist'] < (anchor_price * 0.05))]
+            if not valid_opts.empty:
+                iv_annual = valid_opts.sort_values('dist').head(4)['iv'].mean()
+
+    if iv_annual is None: return None
+    
+    return {"date": date_str, "ticker": ticker, "anchor_price": anchor_price, "iv": iv_annual, "hv": hv_annual, "saved_at": row[1], "is_backtest": True}
 
 def fetch_and_enrich_chain(ticker, expiry_date, snapshot_date=None, snapshot_tag=None, target_strike=None, range_count=None, pivot=None, scope="Front Month"):
     yf_sym = resolve_yf_symbol(ticker)
@@ -672,6 +805,94 @@ def generate_strike_chart(ticker, spot, data, metric="ALL", confluence_data=None
     buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e'); buf.seek(0); plt.close()
     return buf
 
+def generate_pcr_dashboard(ticker, spot, vol_pcr, oi_pcr, vol_data, oi_data, scope_label, expiry_label, max_pain, total_vol):
+    plt.figure(figsize=(14, 9)) # Increased height slightly
+    plt.style.use('dark_background')
+    
+    # Grid: Top=Scoreboard, Mid=Charts, Bottom=Stats/Footer
+    gs = matplotlib.gridspec.GridSpec(3, 2, height_ratios=[0.25, 0.60, 0.15])
+    fig = plt.gcf()
+    fig.patch.set_facecolor('#1e1e1e')
+
+    # --- TOP ROW: SCOREBOARD ---
+    ax_score_l = plt.subplot(gs[0, 0]); ax_score_l.axis('off')
+    c_vol = '#ff5555' if vol_pcr > 1.0 else '#55ff55'
+    ax_score_l.text(0.5, 0.6, "VOLUME PCR (FLOW)", color='white', fontsize=12, ha='center', weight='bold')
+    ax_score_l.text(0.5, 0.1, f"{vol_pcr:.2f}", color=c_vol, fontsize=34, ha='center', weight='bold')
+
+    ax_score_r = plt.subplot(gs[0, 1]); ax_score_r.axis('off')
+    c_oi = '#ff5555' if oi_pcr > 1.0 else '#55ff55'
+    ax_score_r.text(0.5, 0.6, "OPEN INTEREST PCR", color='white', fontsize=12, ha='center', weight='bold')
+    ax_score_r.text(0.5, 0.1, f"{oi_pcr:.2f}", color=c_oi, fontsize=34, ha='center', weight='bold')
+
+    # --- MID ROW: CHARTS ---
+    ax1 = plt.subplot(gs[1, 0]); ax1.set_facecolor('#1e1e1e')
+    total_v = vol_data['calls'] + vol_data['puts']
+    if total_v > 0:
+        bars = ax1.bar(['Calls', 'Puts'], [vol_data['calls'], vol_data['puts']], color=['#00cc00', '#cc0000'], alpha=0.8)
+        ax1.bar_label(bars, labels=[f"{int(vol_data['calls']/1000)}k", f"{int(vol_data['puts']/1000)}k"], padding=3, color='white', weight='bold')
+    ax1.set_title(f"Aggression (Vol)", color='#888888', fontsize=10)
+    ax1.spines['top'].set_visible(False); ax1.spines['right'].set_visible(False)
+
+    ax2 = plt.subplot(gs[1, 1]); ax2.set_facecolor('#1e1e1e')
+    total_o = oi_data['calls'] + oi_data['puts']
+    if total_o > 0:
+        bars = ax2.bar(['Calls', 'Puts'], [oi_data['calls'], oi_data['puts']], color=['#006600', '#660000'], alpha=0.6)
+        ax2.bar_label(bars, labels=[f"{int(oi_data['calls']/1000)}k", f"{int(oi_data['puts']/1000)}k"], padding=3, color='white', weight='bold')
+    ax2.set_title("Structure (OI)", color='#888888', fontsize=10)
+    ax2.spines['top'].set_visible(False); ax2.spines['right'].set_visible(False)
+
+    # --- BOTTOM ROW: STATS & FOOTER ---
+    ax_bot = plt.subplot(gs[2, :]); ax_bot.axis('off')
+    
+    # 1. Signal
+    signal = "NEUTRAL"; sig_c = "white"
+    if vol_pcr > oi_pcr and vol_pcr > 1.0: signal = "FEAR (SHORT TERM)"; sig_c = "#ffaa00"
+    elif vol_pcr < oi_pcr and vol_pcr < 0.8: signal = "COMPLACENCY"; sig_c = "#00ffff"
+    elif vol_pcr > 1.0 and oi_pcr > 1.0: signal = "BEARISH (ALIGNED)"; sig_c = "#ff0000"
+    elif vol_pcr < 0.7 and oi_pcr < 0.7: signal = "BULLISH (ALIGNED)"; sig_c = "#00ff00"
+    
+    # 2. Key Stats Line (Max Pain & Volume)
+    stats_text = f"MAX PAIN: {int(max_pain)}  |  TOTAL VOL: {int(total_vol/1000)}k  |  SPOT: {spot:.2f}"
+    
+    ax_bot.text(0.5, 0.7, stats_text, color='white', fontsize=14, ha='center', weight='bold', bbox=dict(facecolor='#333333', edgecolor='none', pad=6))
+    ax_bot.text(0.5, 0.3, f"SIGNAL: {signal}", color=sig_c, fontsize=12, ha='center', weight='bold')
+    ax_bot.text(0.5, 0.05, f"{ticker} | {expiry_label if expiry_label else scope_label}", color='#666666', ha='center', fontsize=9)
+
+    plt.subplots_adjust(top=0.95, bottom=0.05, hspace=0.4, wspace=0.2)
+    buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e'); buf.seek(0); plt.close()
+    return buf
+
+def generate_vrp_gauge(ticker, iv, hv, spread, ratio):
+    plt.figure(figsize=(10, 5))
+    plt.style.use('dark_background')
+    ax = plt.gca(); ax.axis('off')
+    
+    # Title
+    plt.text(0.5, 0.9, f"VOLATILITY RISK PREMIUM (VRP)", color='white', fontsize=16, weight='bold', ha='center')
+    
+    # The Big Number (Spread)
+    c_spr = '#00ff00' if spread > 0 else '#ff0000' # Green = Sell Prem, Red = Buy Prem
+    sign = "+" if spread > 0 else ""
+    plt.text(0.5, 0.6, f"{sign}{spread:.2f}%", color=c_spr, fontsize=40, weight='bold', ha='center')
+    
+    # Subtitle (Action)
+    action = "OVERPRICED (SELL)" if spread > 0 else "UNDERPRICED (BUY)"
+    plt.text(0.5, 0.45, action, color=c_spr, fontsize=12, weight='bold', ha='center', bbox=dict(facecolor='#222222', edgecolor=c_spr, pad=5))
+    
+    # Details Row
+    plt.text(0.25, 0.25, "IMPLIED (IV)", color='#00ccff', fontsize=10, ha='center')
+    plt.text(0.25, 0.15, f"{iv*100:.2f}%", color='white', fontsize=14, weight='bold', ha='center')
+    
+    plt.text(0.75, 0.25, "REALIZED (HV)", color='#ffaa00', fontsize=10, ha='center')
+    plt.text(0.75, 0.15, f"{hv*100:.2f}%", color='white', fontsize=14, weight='bold', ha='center')
+    
+    # Footer
+    plt.text(0.5, 0.05, f"{ticker} | Ratio: {ratio:.2f}x", color='#666666', fontsize=9, ha='center')
+    
+    buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e'); buf.seek(0); plt.close()
+    return buf
+
 # --- DISCORD INIT ---
 try: asyncio.get_running_loop()
 except RuntimeError: asyncio.set_event_loop(asyncio.new_event_loop())
@@ -768,13 +989,25 @@ async def beeks_help(
 
     elif command == "dom_skew":
         embed.title="📘 Manual: Skew"
-        embed.description="**Sentiment Detector (Put/Call Ratio)**\nCompares the cost of OTM Puts (Downside Protection) vs OTM Calls (Upside FOMO)."
-        embed.add_field(name="Modes", value="**Intraday:** Checks 0DTE Skew (1% OTM). Immediate sentiment.\n**Macro:** Checks 30-Day Skew (5% OTM). Hedging sentiment.", inline=False)
+        embed.description="**Sentiment Detector (Put/Call Ratio)**\nCompares the cost of Downside Protection (Puts) vs Upside Speculation (Calls)."
+        embed.add_field(name="Methods", value="**Percentage:** Fixed distance (Spot ±1% or ±5%). Best for levels/scalping.\n**Delta:** Institutional standard (25 Delta). Best for pure sentiment/fear.", inline=False)
+        embed.add_field(name="Modes", value="**Intraday:** 0DTE (Expires Today).\n**Macro:** 30-Day (Hedging View).", inline=False)
 
     elif command == "setmode":
         embed.title="📘 Manual: Set Mode"
         embed.description="**Global Terminal View**\nConfigure how the bot delivers data to you."
         embed.add_field(name="Options", value="**Modern:** Generates visual charts and PNG dashboards. (Best for Desktop)\n**Bloomberg:** Returns raw text and ASCII tables. (Best for Mobile/Low Data)", inline=False)
+
+    elif command == "dom_pcr":
+        embed.title="📘 Manual: Put-Call Ratio (PCR)"
+        embed.description="**Volume vs. Open Interest (Flow vs. Structure)**\nCompare the intraday aggression (Volume) against the overnight positioning (Open Interest)."
+        embed.add_field(name="The Logic", value="**Volume PCR:** Measures today's panic/greed.\n**OI PCR:** Measures structural hedges.\n**Divergence:** If Vol PCR spikes > OI PCR, it's often short-term panic.", inline=False)
+        embed.add_field(name="Signals", value="**> 1.0:** Bearish.\n**< 0.7:** Bullish.\n**Vol > OI:** Speculative Fear.", inline=False)
+
+    elif command == "dom_vrp":
+        embed.title="📘 Manual: Volatility Risk Premium"
+        embed.description="**The Edge Meter (IV vs RV)**\nCompares Implied Volatility (what we expect) vs Realized Volatility (what happened)."
+        embed.add_field(name="Strategy", value="**Green (Positive):** Options are expensive. Edge is in SELLING (Iron Condors).\n**Red (Negative):** Options are cheap. Edge is in BUYING (Long Straddles).", inline=False)
 
     await ctx.respond(embed=embed, ephemeral=True)
 
@@ -784,7 +1017,13 @@ async def beeks_setmode(ctx: discord.ApplicationContext, terminal: Option(str, c
     await ctx.respond(f"🌎 **Global Terminal View** set to: **{terminal.upper()}**", ephemeral=True)
 
 @beeks.command(name="dailyrange", description="Get Volatility Ranges")
-async def beeks_dailyrange(ctx: discord.ApplicationContext, ticker: Option(str, required=True), engine: Option(str, choices=["Insider Info", "Market Floor"], default="Insider Info"), replay_date: Option(str, autocomplete=get_db_dates, required=False), session: Option(str, autocomplete=get_db_tags, required=False)):
+async def beeks_dailyrange(
+    ctx: discord.ApplicationContext, 
+    ticker: Option(str, required=True), 
+    engine: Option(str, choices=["Insider Info", "Market Floor"], default="Insider Info"), 
+    replay_date: Option(str, autocomplete=get_db_dates, required=False), 
+    session: Option(str, autocomplete=get_db_tags, required=False)
+):
     await ctx.defer(ephemeral=True)
     raw_ticker = ticker.upper(); yf_sym = resolve_yf_symbol(raw_ticker)
     FUTURES_MAP = {"ES": "ES=F", "NQ": "NQ=F", "YM": "YM=F", "RTY": "RTY=F"}; is_future = raw_ticker in FUTURES_MAP; futures_ticker = FUTURES_MAP.get(raw_ticker)
@@ -794,19 +1033,26 @@ async def beeks_dailyrange(ctx: discord.ApplicationContext, ticker: Option(str, 
         data = fetch_historical_data(yf_sym, replay_date, tag_to_use)
         if not data: await ctx.respond(f"❌ **Beeks:** 'File not found.'", ephemeral=True); return
         clean_footer = f"📼 REPLAY: {replay_date} [{tag_to_use}]"; movie_quote = random.choice(MOVIE_QUOTES)
+        # Replays always anchor to the saved price (usually Close/Spot of that moment)
+        anchor_label = "SNAPSHOT" 
     else:
         if not (yf_sym in ["^GSPC", "^NDX"] or is_future or (not yf_sym.startswith("^") and not yf_sym.endswith("=F"))): await ctx.respond(f"❌ **Beeks:** 'Incompatible Ticker.'", ephemeral=True); return
         data = fetch_market_data(yf_sym)
         if not data: await ctx.respond(f"❌ **Beeks:** 'Data corrupted.'", ephemeral=True); return
         movie_quote = random.choice(MOVIE_QUOTES)
+        
         ny_tz = pytz.timezone('America/New_York'); ny_now = datetime.datetime.now(ny_tz)
-        data_date_ny = data['date_obj'].astimezone(ny_tz).date() if data.get('date_obj') else ny_now.date()
-        anchor_label = "OPEN" if data_date_ny == ny_now.date() else "PREV CLOSE"
+        
+        # --- NEW LABEL LOGIC ---
+        # We trust the data packet to tell us what price it used
+        anchor_label = data.get('anchor_type', "REF")
         clean_footer = f"NY TIME: {ny_now.strftime('%H:%M')} ET | REF: {anchor_label}"
         if 'saved_at' in data: clean_footer = f"⚠️ ARCHIVE DATA | {data['saved_at']}"
 
     levels = calculate_levels(data['anchor_price'], data['iv'], data['hv'], engine)
     display_price = data['anchor_price']
+    
+    # Futures Offset Logic
     if is_future and not replay_date:
         try:
             ft = yf.Ticker(futures_ticker); spx = yf.Ticker(yf_sym); f_hist = ft.history(period="5d"); s_hist = spx.history(period="5d")
@@ -819,11 +1065,12 @@ async def beeks_dailyrange(ctx: discord.ApplicationContext, ticker: Option(str, 
         
     chart_data = data.copy(); chart_data['anchor_price'] = display_price
     view_setting = get_user_terminal_setting(ctx.author.id) 
+    
     if view_setting == "bloomberg":
         msg = f"> **{movie_quote}**\n\n**{raw_ticker} VOLATILITY REPORT ({engine})**\n\n`{'RANGE':<12} | {'VALUE':<12} | {'MOVE':<12} | {'TYPE':<12}\n" + "-"*56 + "\n"
         msg += f"{'IV':<12} | {data['iv']:<12.4f} | {levels['meta']['daily_move_iv']:<12.2f} | {'Implied'}\n{'HV':<12} | {data['hv']:<12.4f} | {levels['meta']['daily_move_hv']:<12.2f} | {'Historical'}\n`\n\n**{raw_ticker} LEVELS**\n`{'LEVEL':<12} | {'VALENTINE':<15} | {'WINTHORPE':<15}\n" + "-"*48 + "\n"
         for i in range(4, 0, -1): msg += f"+{i}σ          | {levels['valentine'][f'+{i}σ']:<15.2f} | {levels['winthorpe'][f'+{i}σ']:<15.2f}\n" 
-        msg += f"REF          | {display_price:.2f}\n" 
+        msg += f"{anchor_label:<12} | {display_price:.2f}\n" 
         for i in range(1, 5): msg += f"-{i}σ          | {levels['valentine'][f'-{i}σ']:<15.2f} | {levels['winthorpe'][f'-{i}σ']:<15.2f}\n" 
         msg += f"`\n*{clean_footer}*"
         await ctx.respond(msg, ephemeral=True)
@@ -874,10 +1121,57 @@ async def beeks_dailylevels(
         await ctx.interaction.edit_original_response(content="", embed=embed, file=file)
     else:
         lines = [f"> **{quote}**"]
+        
+        # Helper: Format large numbers (1.2B, 500M, 100K)
+        def fmt(n):
+            if abs(n) >= 1_000_000_000: return f"{n/1_000_000_000:.1f}B"
+            if abs(n) >= 1_000_000: return f"{n/1_000_000:.1f}M"
+            if abs(n) >= 1_000: return f"{n/1_000:.0f}K"
+            return f"{n:.0f}"
+
         if metric == "CONFLUENCE":
-            lines += ["```yaml", "+---------------------------------------+", "| KEY LEVELS (HIGHEST OVERLAP)          |", "+---------------------------------------+"]
+            lines += ["```yaml", f"SPOT REF: {spot_price:.2f}", "+---------------------------------------+", "| KEY LEVELS (HIGHEST OVERLAP)          |", "+---------------------------------------+"]
             for i in confluence_map: lines.append(f"| {int(i['strike']):<7} | {'*'*i['score']:<4} | {i['tags']:<5} |")
             lines.append("```")
+        
+        else:
+            # --- DATA TABLE GENERATION ---
+            # 1. Find index of strike closest to spot
+            s_list = strike_data['strikes']
+            closest_idx = min(range(len(s_list)), key=lambda i: abs(s_list[i]-spot_price))
+            
+            # 2. Slice ±10 strikes around spot (Total 21 rows) to fit text limit
+            start = max(0, closest_idx - 10)
+            end = min(len(s_list), closest_idx + 11)
+            
+            lines.append("```yaml")
+            
+            # 3. Build Header based on Metric
+            if metric == "ALL":
+                lines.append(f"|{'STRIKE':^8}|{'GEX':^7}|{'DEX':^7}|{'VEX':^7}|")
+                lines.append("-" * 32)
+            else:
+                lines.append(f"|{'STRIKE':^8}|{metric:^10}|")
+                lines.append("-" * 20)
+
+            # 4. Build Rows
+            for i in range(start, end):
+                k = s_list[i]
+                prefix = ">" if i == closest_idx else " " # Highlight ATM
+                
+                if metric == "ALL":
+                    g = fmt(strike_data['gex'][i])
+                    d = fmt(strike_data['dex'][i])
+                    v = fmt(strike_data['vex'][i])
+                    lines.append(f"{prefix}|{int(k):<7}|{g:>7}|{d:>7}|{v:>7}|")
+                else:
+                    # Single Metric View
+                    val = fmt(strike_data[metric.lower()][i])
+                    lines.append(f"{prefix}|{int(k):<7}|{val:>10}|")
+            
+            lines.append("```")
+            lines.append(f"**Spot:** {spot_price:.2f} | **Range:** ±10 Strikes")
+
         await ctx.interaction.edit_original_response(content="\n".join(lines))
 
 @beeks.command(name="chain", description="View Raw Chain")
@@ -887,7 +1181,7 @@ async def beeks_chain(ctx: discord.ApplicationContext, ticker: Option(str, requi
     calc_date = replay_date if replay_date else None; calc_tag = session; 
     if calc_date and not calc_tag: calc_tag = get_latest_tag_for_date(display_ticker, calc_date)
     data = fetch_and_enrich_chain(ticker=ticker, expiry_date=expiry, snapshot_date=calc_date, snapshot_tag=calc_tag, scope="Specific" if expiry else "Front Month", range_count=actual_rows, pivot=center)
-    if not data: await ctx.respond(f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'", ephemeral=True); return
+    if not data: await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True); return
     spot = data[0]['spot']; target_date = expiry if expiry else "FRONT MONTH"; view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES); source_label = f"DB: {calc_date} [{calc_tag}]" if calc_date else "LIVE"
     closest_strike = min([d['strike'] for d in data], key=lambda x: abs(x - spot))
     table_rows = []; grouped = {}
@@ -945,7 +1239,7 @@ async def dom_flip(ctx: discord.ApplicationContext, ticker: Option(str, required
     else: status_msg = f"⏳ **Beeks:** 'Scanning {scope}...'"; target_date = None
     await ctx.interaction.edit_original_response(content=status_msg)
     raw_data = fetch_and_enrich_chain(ticker=ticker, expiry_date=target_date, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope)
-    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'"); return
+    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'"); return
     spot_price = raw_data[0].get('spot') or yf.Ticker(yf_sym).history(period="1d")['Close'].iloc[-1]; flip_price, plot_data = calculate_gamma_flip(raw_data, spot_price)
     view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
     if view_setting == 'modern' and plot_data:
@@ -967,7 +1261,7 @@ async def dom_vig(ctx: discord.ApplicationContext, ticker: Option(str, required=
     if calc_date and not calc_tag: yf_sym = resolve_yf_symbol(ticker); db_ticker = get_options_ticker(yf_sym); calc_tag = get_latest_tag_for_date(db_ticker, calc_date)
     scope = "Specific" if expiry else "0DTE"
     data = fetch_and_enrich_chain(ticker=ticker, expiry_date=expiry, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope, range_count=9999)
-    if not data: await ctx.respond(f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'", ephemeral=True); return
+    if not data: await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True); return
     spot = data[0]['spot']; df = pd.DataFrame(data); unique_strikes = np.array(sorted(df['strike'].unique())); atm_strike = unique_strikes[np.abs(unique_strikes - spot).argmin()]
     atm_opts = df[df['strike'] == atm_strike]; call = atm_opts[atm_opts['type'].str.lower() == 'call']; put = atm_opts[atm_opts['type'].str.lower() == 'put']
     if call.empty or put.empty: await ctx.respond(f"❌ **Beeks:** 'ATM Straddle incomplete for {atm_strike}.'", ephemeral=True); return
@@ -993,37 +1287,263 @@ async def dom_vig(ctx: discord.ApplicationContext, ticker: Option(str, required=
         await ctx.respond(msg, ephemeral=True)
 
 @dom_group.command(name="skew", description="Put/Call Sentiment Ratio")
-async def dom_skew(ctx: discord.ApplicationContext, ticker: Option(str, required=True), mode: Option(str, choices=["Intraday", "Macro"], default="Intraday", description="Intraday (0DTE/1%) or Macro (30D/5%)"), expiry: Option(str, description="Override Date (YYYY-MM-DD)", required=False), replay_date: Option(str, description="Backtest Date", autocomplete=get_db_dates, required=False), session: Option(str, description="Session Tag", autocomplete=get_db_tags, required=False)):
+async def dom_skew(
+    ctx: discord.ApplicationContext, 
+    ticker: Option(str, required=True), 
+    mode: Option(str, choices=["Intraday", "Macro"], default="Intraday", description="Timeframe: Intraday (0DTE) or Macro (30D)"), 
+    method: Option(str, choices=["Percentage", "Delta"], default="Percentage", description="Logic: Percentage (Distance) or Delta (Probability)"),
+    expiry: Option(str, description="Override Date (YYYY-MM-DD)", required=False), 
+    replay_date: Option(str, description="Backtest Date", autocomplete=get_db_dates, required=False), 
+    session: Option(str, description="Session Tag", autocomplete=get_db_tags, required=False)
+):
     await ctx.defer(ephemeral=True)
-    if mode == "Intraday": scope_req = "0DTE"; otm_dist = 0.01; dist_label = "1%"
-    else: scope_req = "Front Month"; otm_dist = 0.05; dist_label = "5%"
+    
+    # 1. SETUP PARAMETERS
+    if mode == "Intraday": 
+        scope_req = "0DTE"
+        otm_dist = 0.01; dist_label = "1%" # Default for Percentage
+    else: 
+        scope_req = "Front Month"
+        otm_dist = 0.05; dist_label = "5%" # Default for Percentage
+    
     if expiry: scope_req = "Specific"
+    
     calc_date = replay_date if replay_date else None; calc_tag = session
-    if calc_date and not calc_tag: yf_sym = resolve_yf_symbol(ticker); db_ticker = get_options_ticker(yf_sym); calc_tag = get_latest_tag_for_date(db_ticker, calc_date)
+    if calc_date and not calc_tag: 
+        yf_sym = resolve_yf_symbol(ticker)
+        db_ticker = get_options_ticker(yf_sym)
+        calc_tag = get_latest_tag_for_date(db_ticker, calc_date)
+
+    # 2. FETCH DATA
     data = fetch_and_enrich_chain(ticker=ticker, expiry_date=expiry, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope_req, range_count=9999)
-    if not data: await ctx.respond(f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'", ephemeral=True); return
-    spot = data[0]['spot']; df = pd.DataFrame(data)
-    if expiry: skew_chain = df; target_time = df['time_year'].iloc[0]
-    elif mode == "Intraday": unique_times = sorted(df['time_year'].unique()); target_time = unique_times[0]; skew_chain = df[df['time_year'] == target_time]
-    else: unique_times = sorted(df['time_year'].unique()); target_time = min(unique_times, key=lambda x: abs(x - 0.082)); skew_chain = df[df['time_year'] == target_time]
-    put_strike_target = spot * (1 - otm_dist); call_strike_target = spot * (1 + otm_dist)
-    puts = skew_chain[skew_chain['type'].str.lower() == 'put']; calls = skew_chain[skew_chain['type'].str.lower() == 'call']
-    if puts.empty or calls.empty: await ctx.respond(f"❌ **Beeks:** 'Chain too thin for Skew.'", ephemeral=True); return
-    put_row = puts.iloc[np.abs(puts['strike'] - put_strike_target).argmin()]; call_row = calls.iloc[np.abs(calls['strike'] - call_strike_target).argmin()]
-    put_iv = put_row['iv'] * 100; call_iv = call_row['iv'] * 100; ratio = (put_iv / call_iv) if call_iv != 0 else 0
+    if not data: 
+        await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True)
+        return
+    
+    spot = data[0]['spot']
+    df = pd.DataFrame(data)
+
+    # 3. FILTER FOR EXPIRATION
+    if expiry: 
+        skew_chain = df
+        target_time = df['time_year'].iloc[0]
+    elif mode == "Intraday": 
+        unique_times = sorted(df['time_year'].unique())
+        target_time = unique_times[0]
+        skew_chain = df[df['time_year'] == target_time]
+    else: 
+        unique_times = sorted(df['time_year'].unique())
+        # Find exp closest to 30 days (0.082 years)
+        target_time = min(unique_times, key=lambda x: abs(x - 0.082))
+        skew_chain = df[df['time_year'] == target_time]
+
+    puts = skew_chain[skew_chain['type'].str.lower() == 'put']
+    calls = skew_chain[skew_chain['type'].str.lower() == 'call']
+    
+    if puts.empty or calls.empty: 
+        await ctx.respond(f"❌ **Beeks:** 'Chain too thin for Skew.'", ephemeral=True)
+        return
+
+    # 4. SELECT STRIKES (THE SWITCH)
+    if method == "Delta":
+        # Institutional Standard: 25 Delta Risk Reversal
+        # Puts: Closest to -0.25 Delta
+        put_row = puts.iloc[(puts['delta'] - (-0.25)).abs().argsort()[:1]].iloc[0]
+        # Calls: Closest to 0.25 Delta
+        call_row = calls.iloc[(calls['delta'] - 0.25).abs().argsort()[:1]].iloc[0]
+        
+        label_p = f"25Δ {int(put_row['strike'])}"
+        label_c = f"25Δ {int(call_row['strike'])}"
+        header_sub = "25 DELTA RISK REVERSAL"
+    
+    else: # Method == "Percentage"
+        # Retail Standard: Fixed Distance
+        put_strike_target = spot * (1 - otm_dist)
+        call_strike_target = spot * (1 + otm_dist)
+        
+        put_row = puts.iloc[np.abs(puts['strike'] - put_strike_target).argmin()]
+        call_row = calls.iloc[np.abs(calls['strike'] - call_strike_target).argmin()]
+        
+        label_p = f"-{dist_label} {int(put_row['strike'])}"
+        label_c = f"+{dist_label} {int(call_row['strike'])}"
+        header_sub = f"FIXED DISTANCE ({dist_label})"
+
+    # 5. CALCULATE SKEW
+    put_iv = put_row['iv'] * 100
+    call_iv = call_row['iv'] * 100
+    ratio = (put_iv / call_iv) if call_iv != 0 else 0
+    
     sentiment = "BEARISH (HEDGING)" if ratio > 1.2 else "BULLISH (FOMO)" if ratio < 0.8 else "NEUTRAL"
-    view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES); source = f"DB: {calc_date} [{calc_tag}]" if calc_date else "LIVE"; dte_days = int(target_time * 365); expiry_str = f"{dte_days} DTE" if dte_days > 0 else "EXPIRES TODAY"
+    view_setting = get_user_terminal_setting(ctx.author.id)
+    quote = random.choice(MOVIE_QUOTES)
+    source = f"DB: {calc_date} [{calc_tag}]" if calc_date else "LIVE"
+    dte_days = int(target_time * 365)
+    expiry_str = f"{dte_days} DTE" if dte_days > 0 else "EXPIRES TODAY"
+
+    # 6. OUTPUT VIEWS
     if view_setting == "modern":
-        plt.figure(figsize=(10, 5)); plt.style.use('dark_background'); ax = plt.gca(); ax.axis('off')
+        plt.figure(figsize=(10, 5))
+        plt.style.use('dark_background')
+        ax = plt.gca()
+        ax.axis('off')
+        
         c_sent = '#ff5555' if ratio > 1.2 else '#55ff55' if ratio < 0.8 else '#ffff55'
-        plt.text(0.5, 0.85, f"VOLATILITY SKEW ({mode.upper()})", color='white', fontsize=16, weight='bold', ha='center'); plt.text(0.5, 0.77, f"{expiry_str}", color='#888888', fontsize=10, weight='bold', ha='center')
-        plt.text(0.5, 0.55, f"{ratio:.2f}", color=c_sent, fontsize=36, weight='bold', ha='center'); plt.text(0.5, 0.45, sentiment, color=c_sent, fontsize=12, weight='bold', ha='center', bbox=dict(facecolor='#222222', edgecolor=c_sent, pad=5))
-        plt.text(0.20, 0.30, f"PUTS (-{dist_label})", color='#ff99cc', fontsize=10, ha='center'); plt.text(0.20, 0.15, f"{put_iv:.1f}%", color='white', fontsize=16, weight='bold', ha='center')
-        plt.text(0.80, 0.30, f"CALLS (+{dist_label})", color='#99ccff', fontsize=10, ha='center'); plt.text(0.80, 0.15, f"{call_iv:.1f}%", color='white', fontsize=16, weight='bold', ha='center')
+        
+        # Main Headers
+        plt.text(0.5, 0.85, f"VOLATILITY SKEW ({mode.upper()})", color='white', fontsize=16, weight='bold', ha='center')
+        plt.text(0.5, 0.77, f"{header_sub} | {expiry_str}", color='#888888', fontsize=10, weight='bold', ha='center')
+        
+        # The Big Number
+        plt.text(0.5, 0.55, f"{ratio:.2f}", color=c_sent, fontsize=36, weight='bold', ha='center')
+        plt.text(0.5, 0.45, sentiment, color=c_sent, fontsize=12, weight='bold', ha='center', bbox=dict(facecolor='#222222', edgecolor=c_sent, pad=5))
+        
+        # Left Side (Puts)
+        plt.text(0.20, 0.30, f"PUTS ({label_p})", color='#ff99cc', fontsize=10, ha='center')
+        plt.text(0.20, 0.15, f"{put_iv:.1f}%", color='white', fontsize=16, weight='bold', ha='center')
+        
+        # Right Side (Calls)
+        plt.text(0.80, 0.30, f"CALLS ({label_c})", color='#99ccff', fontsize=10, ha='center')
+        plt.text(0.80, 0.15, f"{call_iv:.1f}%", color='white', fontsize=16, weight='bold', ha='center')
+        
+        # Footer
         plt.text(0.5, 0.05, f"{ticker.upper()} @ {spot:.2f} | {source}", color='#666666', fontsize=9, ha='center')
-        buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e'); buf.seek(0); plt.close(); file = discord.File(buf, filename="skew.png"); embed = discord.Embed(description=f"**{quote}**", color=0xFF99CC); embed.set_image(url="attachment://skew.png"); await ctx.respond(embed=embed, file=file, ephemeral=True)
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e')
+        buf.seek(0)
+        plt.close()
+        
+        file = discord.File(buf, filename="skew.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0xFF99CC)
+        embed.set_image(url="attachment://skew.png")
+        await ctx.respond(embed=embed, file=file, ephemeral=True)
+        
     else:
-        msg = f"**{ticker.upper()} SKEW ({mode.upper()})**\nSource: `{source}` | {expiry_str}\n```yaml\nPUT IV  (-{dist_label}): {put_iv:.1f}%\nCALL IV (+{dist_label}): {call_iv:.1f}%\nRATIO:         {ratio:.2f}\nSENTIMENT:     {sentiment}\n```"
+        # Bloomberg View
+        msg = f"**{ticker.upper()} SKEW ({mode.upper()})**\nSource: `{source}` | {expiry_str}\n"
+        msg += f"Method: {header_sub}\n"
+        msg += "```yaml\n"
+        msg += f"{'SIDE':<10} | {'TARGET':<12} | {'IV':<8}\n"
+        msg += "-"*36 + "\n"
+        msg += f"{'PUTS':<10} | {label_p:<12} | {put_iv:.1f}%\n"
+        msg += f"{'CALLS':<10} | {label_c:<12} | {call_iv:.1f}%\n"
+        msg += "-"*36 + "\n"
+        msg += f"RATIO:      {ratio:.2f}\n"
+        msg += f"SENTIMENT:  {sentiment}\n"
+        msg += "```"
+        await ctx.respond(msg, ephemeral=True)
+
+@dom_group.command(name="pcr", description="Put-Call Ratio & Max Pain")
+async def dom_pcr(
+    ctx: discord.ApplicationContext, 
+    ticker: Option(str, required=True), 
+    scope: Option(str, choices=["0DTE", "Front Month", "Total Market"], default="0DTE"),
+    expiry: Option(str, description="Date (YYYY-MM-DD)", required=False),
+    replay_date: Option(str, autocomplete=get_db_dates, required=False), 
+    session: Option(str, autocomplete=get_db_tags, required=False)
+):
+    await ctx.defer(ephemeral=True)
+    scope_req = "Specific" if expiry else scope
+    calc_date = replay_date if replay_date else None; calc_tag = session
+    
+    # Smart 0DTE Logic
+    if calc_date and not calc_tag: 
+        yf_sym = resolve_yf_symbol(ticker); db_ticker = get_options_ticker(yf_sym)
+        calc_tag = get_latest_tag_for_date(db_ticker, calc_date)
+    elif scope == "0DTE" and not replay_date and not expiry:
+        market_time = datetime.datetime.now(ZoneInfo("America/New_York"))
+        target_date = market_time.strftime("%Y-%m-%d") if market_time.weekday() < 4 and market_time.hour < 16 else get_next_market_date(market_time)
+        yf_sym = resolve_yf_symbol(ticker); db_ticker = get_options_ticker(yf_sym)
+        conn = sqlite3.connect("beeks.db"); c = conn.cursor()
+        c.execute("SELECT date(timestamp) FROM chain_snapshots WHERE ticker = ? AND tag = 'CLOSE' AND date(timestamp) = ? ORDER BY timestamp DESC LIMIT 1", (db_ticker, target_date))
+        if c.fetchone(): calc_date = target_date; calc_tag = "CLOSE"
+        conn.close()
+
+    data = fetch_and_enrich_chain(ticker=ticker, expiry_date=expiry, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope_req, range_count=9999)
+    if not data: await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True); return
+
+    spot = data[0]['spot']; df = pd.DataFrame(data)
+    
+    # --- CALCS ---
+    puts = df[df['type'].str.lower() == 'put']; calls = df[df['type'].str.lower() == 'call']
+    put_vol = puts['volume'].sum(); call_vol = calls['volume'].sum()
+    put_oi = puts['oi'].sum(); call_oi = calls['oi'].sum()
+    vol_pcr = (put_vol / call_vol) if call_vol > 0 else 0
+    oi_pcr = (put_oi / call_oi) if call_oi > 0 else 0
+    
+    # NEW: Max Pain
+    max_pain = calculate_max_pain(data)
+    total_vol = put_vol + call_vol
+
+    # --- OUTPUT ---
+    view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
+    source = f"DB: {calc_date} [{calc_tag}]" if calc_date else "LIVE"
+    label = expiry if expiry else scope
+
+    if view_setting == 'modern':
+        vol_stats = {'calls': call_vol, 'puts': put_vol}; oi_stats = {'calls': call_oi, 'puts': put_oi}
+        img_buf = generate_pcr_dashboard(ticker.upper(), spot, vol_pcr, oi_pcr, vol_stats, oi_stats, scope, label, max_pain, total_vol)
+        file = discord.File(img_buf, filename="pcr.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://pcr.png")
+        await ctx.respond(embed=embed, file=file, ephemeral=True)
+    else:
+        # Bloomberg View
+        msg = f"**{ticker.upper()} SENTIMENT REPORT**\nSource: `{source}` | Scope: `{label}`\n"
+        msg += "```yaml\n"
+        msg += f"{'METRIC':<15} | {'PCR':<6} | {'PUTS':<8} | {'CALLS':<8}\n" + "-"*50 + "\n"
+        msg += f"{'VOLUME':<15} | {vol_pcr:<6.2f} | {int(put_vol):<8} | {int(call_vol):<8}\n"
+        msg += f"{'OPEN INT':<15} | {oi_pcr:<6.2f} | {int(put_oi):<8} | {int(call_oi):<8}\n" + "-"*50 + "\n"
+        msg += f"MAX PAIN: {int(max_pain)}\nTOTAL VOL: {int(total_vol)}\n```"
+        await ctx.respond(msg, ephemeral=True)
+
+@dom_group.command(name="vrp", description="Volatility Risk Premium (Edge Meter)")
+async def dom_vrp(
+    ctx: discord.ApplicationContext, 
+    ticker: Option(str, required=True)
+):
+    await ctx.defer(ephemeral=True)
+    yf_sym = resolve_yf_symbol(ticker)
+    
+    # 1. Fetch Data
+    # Note: Relies on the FIXED fetch_market_data() that returns None on failure (no DB fallback)
+    data = fetch_market_data(yf_sym) 
+    
+    if not data: 
+        await ctx.respond(f"❌ **Beeks:** 'Feed Dark. No price history for {ticker}.'", ephemeral=True)
+        return
+
+    iv = data['iv']
+    hv = data['hv']
+    
+    # 2. VALIDATION CHECK
+    # If IV is exactly equal to HV, the Option Chain fetch failed and defaulted to baseline.
+    # We reject this data to prevent false "Neutral" signals.
+    if abs(iv - hv) < 0.00001:
+        await ctx.respond(f"⚠️ **Beeks:** 'Option Chain Unstable. Cannot calculate VRP.'\n*Reason: IV data missing, system defaulted to HV baseline.*", ephemeral=True)
+        return
+
+    spread = (iv - hv) * 100 # Percentage points
+    ratio = iv / hv if hv != 0 else 0
+    
+    view_setting = get_user_terminal_setting(ctx.author.id)
+    quote = random.choice(MOVIE_QUOTES)
+    
+    if view_setting == 'modern':
+        img_buf = generate_vrp_gauge(ticker.upper(), iv, hv, spread, ratio)
+        file = discord.File(img_buf, filename="vrp.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31)
+        embed.set_image(url="attachment://vrp.png")
+        await ctx.respond(embed=embed, file=file, ephemeral=True)
+    else:
+        # Bloomberg View
+        msg = f"**{ticker.upper()} RISK PREMIUM (VRP)**\n"
+        msg += "```yaml\n"
+        msg += f"IMPLIED VOL (IV):  {iv*100:.2f}%\n"
+        msg += f"REALIZED VOL (HV): {hv*100:.2f}%\n"
+        msg += "-"*30 + "\n"
+        msg += f"SPREAD:            {spread:+.2f}%\n"
+        msg += f"RATIO:             {ratio:.2f}x\n"
+        msg += f"EDGE:              {'SELL PREMIUM' if spread > 0 else 'BUY OPTIONS'}\n```"
         await ctx.respond(msg, ephemeral=True)
 
 @dom_group.command(name="exposures", description="Total Dealer Exposure (GEX/DEX/VEX)")
@@ -1041,7 +1561,7 @@ async def dom_exposures(ctx: discord.ApplicationContext, ticker: Option(str, req
     else: status_msg = f"⏳ **Beeks:** 'Scanning {scope}...'"; target_date = None
     await ctx.interaction.edit_original_response(content=status_msg)
     raw_data = fetch_and_enrich_chain(ticker=ticker, expiry_date=target_date, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope, range_count=9999)
-    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'Feed Dark. Try a snapshot: `/beeks db catalog`'"); return
+    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'"); return
     spot_price = raw_data[0]['spot']; gex, dex, vex = calculate_market_exposures(raw_data, spot_price)
     view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
     if view_setting == 'modern':

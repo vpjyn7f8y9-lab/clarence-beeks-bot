@@ -281,12 +281,23 @@ def update_price_history(ticker):
     c.execute("SELECT MAX(date) FROM price_history WHERE ticker = ?", (yf_sym,))
     last_date = c.fetchone()[0]
     
-    # If we have data, only fetch what's missing. If empty, fetch 5 years.
-    start_date = (datetime.datetime.strptime(last_date, "%Y-%m-%d") + datetime.timedelta(days=1)).strftime("%Y-%m-%d") if last_date else None
+    start_date = None
+    today = datetime.date.today()
+
+    # Logic Fix: Don't download if we already have today's data
+    if last_date:
+        last_dt = datetime.datetime.strptime(last_date, "%Y-%m-%d").date()
+        if last_dt >= today: 
+            conn.close()
+            return # Already up to date
+        start_date = (last_dt + datetime.timedelta(days=1)).strftime("%Y-%m-%d")
     
     try:
-        if start_date: data = yf.download(yf_sym, start=start_date, progress=False)
-        else: data = yf.download(yf_sym, period="5y", progress=False)
+        # Warning Fix: Added auto_adjust=True
+        if start_date: 
+            data = yf.download(yf_sym, start=start_date, progress=False, auto_adjust=True)
+        else: 
+            data = yf.download(yf_sym, period="5y", progress=False, auto_adjust=True)
         
         if not data.empty:
             if isinstance(data.columns, pd.MultiIndex): data = data.xs(yf_sym, axis=1, level=1, drop_level=True) if yf_sym in data.columns.levels[1] else data
@@ -445,7 +456,7 @@ def fetch_and_enrich_chain(ticker, expiry_date, snapshot_date=None, snapshot_tag
     S = 0.0; q = 0.0; r = 0.045
     chain_data = {'calls': [], 'puts': []}
     
-    # --- SNAPSHOT REPLAY ---
+    # --- SNAPSHOT REPLAY (BACKTEST) ---
     if snapshot_date:
         tag = snapshot_tag if snapshot_tag else "CLOSE"
         try:
@@ -462,17 +473,25 @@ def fetch_and_enrich_chain(ticker, expiry_date, snapshot_date=None, snapshot_tag
             q = row[3] if row[3] is not None else data.get('dividend_yield', 0.0)
             
             target_exps = []
-            if scope == "0DTE":
-                if expiry_date and expiry_date in data['expirations']: target_exps = [expiry_date]
-                else:
-                    snap_date_str = snap_ts.strftime("%Y-%m-%d")
-                    if snap_date_str in data['expirations']: target_exps = [snap_date_str]
-                    else: return None
-            elif scope == "Front Month":
-                target_exps = [e for e in data['expirations'] if 0 <= (datetime.datetime.strptime(e, "%Y-%m-%d") - snap_ts).days <= 30]
-            elif scope == "Total Market": target_exps = list(data['expirations'].keys())
-            else: 
+            
+            # LOGIC HIERARCHY
+            # 1. Specific Target (King)
+            if expiry_date:
                 if expiry_date in data['expirations']: target_exps = [expiry_date]
+            
+            # 2. Scope Logic
+            elif scope == "0DTE":
+                # REPLAY RULE: Always show the snapshot date (Post-Mortem), never auto-roll
+                snap_day = snap_ts.strftime("%Y-%m-%d")
+                if snap_day in data['expirations']: target_exps = [snap_day]
+            
+            elif scope == "Front Month":
+                # REPLAY RULE: Exclude Snapshot Date, Show +1 Day to +30 Days
+                snap_day = snap_ts.date()
+                target_exps = [e for e in data['expirations'] if 1 <= (datetime.datetime.strptime(e, "%Y-%m-%d").date() - snap_day).days <= 30]
+            
+            elif scope == "Total Market": 
+                target_exps = list(data['expirations'].keys())
             
             for e in target_exps:
                 exp_dt = datetime.datetime.strptime(e, "%Y-%m-%d")
@@ -487,49 +506,71 @@ def fetch_and_enrich_chain(ticker, expiry_date, snapshot_date=None, snapshot_tag
     # --- LIVE DATA ---
     else:
         try:
-            # 1. Get Price History (Keep using the Index ^GSPC)
+            # 1. Update History & Calc HV Locally (Ensure DB is fresh)
+            update_price_history(yf_sym)
+            
+            # 2. Robust Spot Price Fetch
             tkr = yf.Ticker(yf_sym)
             hist = tkr.history(period="1d")
             if hist.empty: return None
-            S = hist['Close'].iloc[-1]
+            
+            ny_now = datetime.datetime.now(ZoneInfo("America/New_York"))
+            last_row = hist.iloc[-1]
+            
+            # Time-Aware Spot Selection
+            if last_row.name.date() == ny_now.date() and (ny_now.hour < 16 or (ny_now.hour == 16 and ny_now.minute < 15)):
+                S = last_row['Open'] 
+            else:
+                S = last_row['Close']
+            
             q = get_current_yield(yf_sym)
-
-            # 2. DETERMINING THE SEARCH TICKER (MOVED UP)
+            
             search_tkr = tkr
             if yf_sym == "^GSPC":
                  try: 
                      spx = yf.Ticker("^SPX")
-                     # We just blindly trust ^SPX is the one we want if ^GSPC is input
-                     search_tkr = spx
+                     if spx.options: search_tkr = spx
                  except: pass
 
-            # 3. GATEKEEPER VALIDATION (Now using search_tkr)
-            if not validate_atm_data(search_tkr, S): 
-                print(f"DEBUG: Validation failed on {search_tkr.ticker}")
-                return None
+            if not validate_atm_data(search_tkr, S): return None
             
-            # 4. Fetch Options
             all_exps = search_tkr.options
             if not all_exps: return None            
-            target_exps = []
-            now = datetime.datetime.now()
             
-            if scope == "0DTE":
-                today_str = now.strftime("%Y-%m-%d")
-                if today_str in all_exps: target_exps = [today_str]
-                else: return []
-            elif scope == "Total Market": target_exps = all_exps 
-            elif scope == "Front Month":
-                target_exps = [e for e in all_exps if 0 <= (datetime.datetime.strptime(e, "%Y-%m-%d") - now).days <= 35]
-            else:
+            target_exps = []
+            today = datetime.date.today()
+            
+            # LOGIC HIERARCHY
+            # 1. Specific Target (King)
+            if expiry_date:
                 if expiry_date in all_exps: target_exps = [expiry_date]
+            
+            # 2. Scope Logic
+            elif scope == "0DTE":
+                today_str = today.strftime("%Y-%m-%d")
+                # LIVE RULE: If Market Open -> Today. If Closed -> Auto-Roll to Next.
+                is_market_closed = ny_now.hour >= 16 or ny_now.weekday() >= 5
+                
+                if not is_market_closed and today_str in all_exps:
+                    target_exps = [today_str]
+                else:
+                    # Find first expiry that is NOT today
+                    future_exps = [e for e in all_exps if datetime.datetime.strptime(e, "%Y-%m-%d").date() > today]
+                    if future_exps: target_exps = [future_exps[0]]
+            
+            elif scope == "Front Month":
+                # LIVE RULE: Exclude Today (0DTE). Show Tomorrow to +30 Days.
+                target_exps = [e for e in all_exps if 1 <= (datetime.datetime.strptime(e, "%Y-%m-%d").date() - today).days <= 30]
+            
+            elif scope == "Total Market": 
+                target_exps = all_exps 
 
             for e in target_exps:
                 try:
                     opt = search_tkr.option_chain(e)
                     c_list = opt.calls.to_dict(orient='records'); p_list = opt.puts.to_dict(orient='records')
                     exp_dt = datetime.datetime.strptime(e, "%Y-%m-%d")
-                    t_val = (exp_dt - now).days / 365.0
+                    t_val = (exp_dt - ny_now.replace(tzinfo=None)).days / 365.0
                     if t_val < 0.001: t_val = 0.001
                     for x in c_list: x['time_year'] = t_val
                     for x in p_list: x['time_year'] = t_val
@@ -1175,15 +1216,37 @@ async def beeks_dailylevels(
         await ctx.interaction.edit_original_response(content="\n".join(lines))
 
 @beeks.command(name="chain", description="View Raw Chain")
-async def beeks_chain(ctx: discord.ApplicationContext, ticker: Option(str, required=True), expiry: Option(str, required=False), center: Option(float, required=False), rows: Option(int, choices=[1, 3, 5, 10], default=10), replay_date: Option(str, autocomplete=get_db_dates, required=False), session: Option(str, autocomplete=get_db_tags, required=False)):
+async def beeks_chain(
+    ctx: discord.ApplicationContext, 
+    ticker: Option(str, required=True), 
+    scope: Option(str, choices=["0DTE", "Front Month", "Total Market"], default="0DTE"), # <--- NEW DEFAULT
+    expiry: Option(str, required=False), 
+    center: Option(float, required=False), 
+    rows: Option(int, choices=[1, 3, 5, 10], default=10), 
+    replay_date: Option(str, autocomplete=get_db_dates, required=False), 
+    session: Option(str, autocomplete=get_db_tags, required=False)
+):
     await ctx.defer(ephemeral=True)
     yf_sym = resolve_yf_symbol(ticker); display_ticker = get_options_ticker(yf_sym); actual_rows = 11 if rows == 10 else rows
     calc_date = replay_date if replay_date else None; calc_tag = session; 
     if calc_date and not calc_tag: calc_tag = get_latest_tag_for_date(display_ticker, calc_date)
-    data = fetch_and_enrich_chain(ticker=ticker, expiry_date=expiry, snapshot_date=calc_date, snapshot_tag=calc_tag, scope="Specific" if expiry else "Front Month", range_count=actual_rows, pivot=center)
+    
+    # PASS SCOPE TO ENGINE
+    data = fetch_and_enrich_chain(
+        ticker=ticker, 
+        expiry_date=expiry, 
+        snapshot_date=calc_date, 
+        snapshot_tag=calc_tag, 
+        scope=scope, # <--- User Selection
+        range_count=actual_rows, 
+        pivot=center
+    )
+    
     if not data: await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True); return
-    spot = data[0]['spot']; target_date = expiry if expiry else "FRONT MONTH"; view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES); source_label = f"DB: {calc_date} [{calc_tag}]" if calc_date else "LIVE"
+    
+    spot = data[0]['spot']; target_date = expiry if expiry else scope; view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES); source_label = f"DB: {calc_date} [{calc_tag}]" if calc_date else "LIVE"
     closest_strike = min([d['strike'] for d in data], key=lambda x: abs(x - spot))
+    
     table_rows = []; grouped = {}
     for row in data:
         k = row['strike']
@@ -1196,6 +1259,7 @@ async def beeks_chain(ctx: discord.ApplicationContext, ticker: Option(str, requi
         c_iv = c.get('iv', 0) if c else 0; c_delta = c.get('delta', 0) if c else 0; c_gamma = c.get('gamma', 0) if c else 0; c_theta = c.get('theta', 0) if c else 0; c_vol = c.get('volume', 0) if c else 0; c_oi = c.get('oi', 0) if c else 0
         p_iv = p.get('iv', 0) if p else 0; p_delta = p.get('delta', 0) if p else 0; p_gamma = p.get('gamma', 0) if p else 0; p_theta = p.get('theta', 0) if p else 0; p_vol = p.get('volume', 0) if p else 0; p_oi = p.get('oi', 0) if p else 0
         table_rows.append({'strike': k, 'c_iv': c_iv, 'c_delta': c_delta, 'c_gamma': c_gamma, 'c_theta': c_theta, 'c_vol': c_vol, 'c_oi': c_oi, 'p_iv': p_iv, 'p_delta': p_delta, 'p_gamma': p_gamma, 'p_theta': p_theta, 'p_vol': p_vol, 'p_oi': p_oi})
+    
     if view_setting == 'modern':
         plt.figure(figsize=(16, len(table_rows) * 0.5 + 3)); plt.style.use('dark_background'); ax = plt.gca(); ax.axis('off')
         cols = ['VOL', 'OI', 'IV', 'THETA', 'GAMMA', 'DELTA', 'STRIKE', 'DELTA', 'GAMMA', 'THETA', 'IV', 'OI', 'VOL']; cell_text = []; cell_colors = []

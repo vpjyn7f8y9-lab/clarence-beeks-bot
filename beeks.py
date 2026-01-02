@@ -1203,7 +1203,7 @@ async def daily_levels(
     ctx: discord.ApplicationContext, 
     ticker: Option(str, required=True), 
     metric: Option(str, choices=["ALL", "CONFLUENCE", "GEX", "DEX", "VEX", "CEX"], default="ALL"), # <--- RESTORED
-    scope: Option(str, choices=["0DTE", "Front Month", "Total Market"], default="Front Month"),
+    scope: Option(str, choices=["0DTE", "Front Month", "Total Market"], default="0DTE"),
     target_expiry: Option(str, description="Override Scope (Format: YYYY-MM-DD)", required=False), 
     replay_date: Option(str, description="Historical Snapshot (Select from list)", autocomplete=get_db_dates, required=False), 
     session: Option(str, autocomplete=get_db_tags, required=False)
@@ -1215,7 +1215,7 @@ async def daily_levels(
     # Date Logic
     if target_expiry: target_date = target_expiry; calc_date = replay_date if replay_date else None
     elif scope == "0DTE" and not replay_date:
-        target_date = market_time.strftime("%Y-%m-%d") if market_time.weekday() < 4 and market_time.hour < 16 else get_next_market_date(market_time)
+        target_date = market_time.strftime("%Y-%m-%d") if market_time.weekday() <= 4 and market_time.hour < 16 else get_next_market_date(market_time)
         # Check if we should use DB for today (e.g. after close)
         conn = sqlite3.connect("beeks.db"); c = conn.cursor(); c.execute("SELECT date(timestamp) FROM chain_snapshots WHERE ticker = ? AND tag = 'CLOSE' ORDER BY timestamp DESC LIMIT 1", (display_ticker,)); row = c.fetchone(); conn.close()
         if row and row[0] == target_date: calc_date = row[0]; calc_tag = "CLOSE"
@@ -1870,20 +1870,44 @@ async def auto_fetch_heavy_chains():
         if now.weekday() > 4: return
         session_tag = "OPEN" if now.hour < 11 else "MID" if now.hour < 14 else "CLOSE"
         print(f"\n⏰ AUTO-FETCH TRIGGERED [{session_tag}] at {now.strftime('%H:%M:%S')} ET")
-        for symbol in ["^SPX"]:
+        
+        # MAPPING: Price Source -> Option Source
+        targets = {"^GSPC": "^SPX"} 
+        
+        for price_sym, opt_sym in targets.items():
             try:
-                tkr = yf.Ticker(symbol); hist = tkr.history(period="1d")
-                if hist.empty: continue
-                if not validate_atm_data(tkr, hist['Close'].iloc[-1]): print(f"   ⚠️ Skipping {symbol}: Bad Data"); continue
-                full_chain = {"symbol": symbol, "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"), "expirations": {}}
-                exps = tkr.options
+                # 1. Get Price from Index (^GSPC)
+                price_tkr = yf.Ticker(price_sym)
+                hist = price_tkr.history(period="1d")
+                if hist.empty: 
+                    print(f"   ⚠️ No price data for {price_sym}"); continue
+                
+                # 2. Get Chain from Option Ticker (^SPX)
+                opt_tkr = yf.Ticker(opt_sym)
+                if not opt_tkr.options: 
+                    print(f"   ⚠️ No options data for {opt_sym}"); continue
+
+                # 3. Validate Data Quality
+                anchor_price = hist['Close'].iloc[-1]
+                if not validate_atm_data(opt_tkr, anchor_price): 
+                    print(f"   ⚠️ Skipping {opt_sym}: ATM Data Sparse"); continue
+
+                # 4. Build Snapshot
+                full_chain = {"symbol": opt_sym, "timestamp": now.strftime("%Y-%m-%d %H:%M:%S"), "expirations": {}}
+                exps = opt_tkr.options
                 for e in exps:
                     try:
-                        opt = tkr.option_chain(e); full_chain["expirations"][e] = {"calls": opt.calls.to_dict(orient='records'), "puts": opt.puts.to_dict(orient='records')}
+                        opt = opt_tkr.option_chain(e)
+                        full_chain["expirations"][e] = {
+                            "calls": opt.calls.to_dict(orient='records'), 
+                            "puts": opt.puts.to_dict(orient='records')
+                        }
                     except: pass
-                save_snapshot(symbol, full_chain, hist['Close'].iloc[-1], get_current_yield(symbol), tag=session_tag, custom_timestamp=now.strftime("%Y-%m-%d %H:%M:%S"))
-                print(f"   ✅ Snapshot Saved: {symbol} [{session_tag}]")
-            except Exception as e: print(f"   ❌ Failed {symbol}: {e}")
+                
+                save_snapshot(opt_sym, full_chain, anchor_price, get_current_yield(price_sym), tag=session_tag, custom_timestamp=now.strftime("%Y-%m-%d %H:%M:%S"))
+                print(f"   ✅ Snapshot Saved: {opt_sym} [{session_tag}] @ {anchor_price:.2f}")
+
+            except Exception as e: print(f"   ❌ Failed {opt_sym}: {e}")
     except Exception as e: print(f"❌ CRITICAL SCHEDULER ERROR: {e}")
 
 @auto_fetch_heavy_chains.before_loop

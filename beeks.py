@@ -1451,8 +1451,6 @@ async def dom_report(
 
         # B. FLIP
         flip_price, _ = calculate_gamma_flip(data_front, spot)
-        
-        # FIX: Check for None before comparison to avoid Type Error
         if flip_price is not None:
             flip_status = "BULLISH" if spot > flip_price else "BEARISH"
         else:
@@ -1474,8 +1472,6 @@ async def dom_report(
         skew_ratio = 0.0; skew_status = "NEUTRAL"
         if data_front:
             calls = [x for x in data_front if x['type'] == 'Call']; puts = [x for x in data_front if x['type'] == 'Put']
-            
-            # FIX: Ensure we have both calls and puts before running min()
             if calls and puts:
                 c_25 = min(calls, key=lambda x: abs(x['delta'] - 0.25))
                 p_25 = min(puts, key=lambda x: abs(abs(x['delta']) - 0.25))
@@ -1483,12 +1479,21 @@ async def dom_report(
                     skew_ratio = p_25['iv'] / c_25['iv']
                     skew_status = "FEAR" if skew_ratio > 1.15 else "GREED" if skew_ratio < 0.9 else "NEUTRAL"
 
-        # E. PCR
-        vol_pcr = 0.0; max_pain = 0.0
+        # E. PCR (SWITCHED TO OPEN INTEREST)
+        oi_pcr = 0.0; max_pain = 0.0
         if data_0dte:
-            c_vol = sum(x['volume'] for x in data_0dte if x['type'] == 'Call'); p_vol = sum(x['volume'] for x in data_0dte if x['type'] == 'Put')
-            vol_pcr = p_vol / c_vol if c_vol > 0 else 0
+            c_oi = sum(x['oi'] for x in data_0dte if x['type'] == 'Call')
+            p_oi = sum(x['oi'] for x in data_0dte if x['type'] == 'Put')
+            
+            # Sanitization
+            if pd.isna(c_oi): c_oi = 0.0
+            if pd.isna(p_oi): p_oi = 0.0
+            
+            oi_pcr = p_oi / c_oi if c_oi > 0 else 0
+            
             max_pain = calculate_max_pain(data_0dte)
+            # Sanitization for Max Pain
+            if max_pain is not None and pd.isna(max_pain): max_pain = None
 
         # F. VRP
         vrp_spread = 0.0
@@ -1500,11 +1505,6 @@ async def dom_report(
         if view_setting == 'modern':
             # Generate the Main Dashboard Image
             img_exp = generate_exposure_dashboard(display_ticker, spot, gex, dex, vex, "TOTAL MARKET", None)
-            
-            # NOTE: We are intentionally SKIPPING the VRP thumbnail to fix formatting.
-            # If you want VRP visual, we should merge it into the main dashboard later. 
-            # For now, text representation is cleaner.
-
             file_exp = discord.File(img_exp, filename="beeks_exposures.png")
             
             # Executive Summary Embed
@@ -1520,18 +1520,20 @@ async def dom_report(
             
             # ROW 2: Intraday (Vig / PCR / Pain)
             embed.add_field(name="💰 VIG (0DTE)", value=f"**${vig_val:.2f}**\n{vig_lower:.0f}-{vig_upper:.0f}", inline=True)
-            embed.add_field(name="📊 PCR (0DTE)", value=f"**{vol_pcr:.2f}**\n(Vol Ratio)", inline=True)
-            embed.add_field(name="📌 PAIN (0DTE)", value=f"**{max_pain:.0f}**\n(Max Pain)", inline=True)
+            # CHANGED TO OI PCR HERE vvv
+            embed.add_field(name="📊 PCR (0DTE)", value=f"**{oi_pcr:.2f}**\n(Open Interest)", inline=True)
+            
+            mp_display = f"{max_pain:.0f}" if max_pain is not None else "N/A"
+            embed.add_field(name="📌 PAIN (0DTE)", value=f"**{mp_display}**\n(Max Pain)", inline=True)
 
             embed.set_image(url="attachment://beeks_exposures.png")
-            # NO THUMBNAIL SET HERE
             
             await ctx.interaction.edit_original_response(content="", embed=embed, file=file_exp)
 
         else:
             # BLOOMBERG TEXT MODE (Unchanged)
             lines = [f"> **{quote}**", "```yaml", f"CLARENCE BEEKS EXECUTIVE REPORT: {display_ticker}", "="*45]
-            lines.append(f"SPOT: {spot:.2f}  |  {datetime.datetime.now().strftime('%H:%M')} ET")
+            lines.append(f"SPOT: {spot:.2f}   |   {datetime.datetime.now().strftime('%H:%M')} ET")
             lines.append("-" * 45)
             lines.append(f"1. REGIME (TOTAL): {regime}")
             lines.append(f"   Net GEX: ${gex/1_000_000_000:.2f}B")
@@ -1542,8 +1544,11 @@ async def dom_report(
             lines.append("-" * 45)
             lines.append(f"3. INTRADAY (0DTE)")
             lines.append(f"   Vig (Cost): ${vig_val:.2f} [{vig_lower:.0f}-{vig_upper:.0f}]")
-            lines.append(f"   Vol PCR:    {vol_pcr:.2f}")
-            lines.append(f"   Max Pain:   {max_pain:.0f}")
+            # CHANGED TO OI PCR HERE vvv
+            lines.append(f"   OI PCR:     {oi_pcr:.2f}")
+            
+            mp_display = f"{max_pain:.0f}" if max_pain is not None else "N/A"
+            lines.append(f"   Max Pain:   {mp_display}")
             lines.append("-" * 45)
             lines.append(f"4. VALUE (VRP)")
             lines.append(f"   Premium:    {vrp_spread:+.2f}% ({'SELL' if vrp_spread>0 else 'BUY'})")

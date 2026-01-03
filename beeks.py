@@ -1353,7 +1353,7 @@ async def daily_levels(
     except Exception as e:
         await ctx.interaction.edit_original_response(content=f"⚠️ **Beeks:** 'Level Mapping Failed: {e}'")
 
-@dom_group.command(name="chain", description="View Raw Option Chain Data")
+@beeks.command(name="chain", description="View Raw Option Chain Data")
 async def dom_chain(
     ctx: discord.ApplicationContext, 
     ticker: Option(str, required=True), 

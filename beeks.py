@@ -1534,38 +1534,42 @@ async def dom_exposures(
     session: Option(str, autocomplete=get_db_tags, required=False)
 ):
     await ctx.defer(ephemeral=True)
-    yf_sym = resolve_yf_symbol(ticker); display_ticker = get_options_ticker(yf_sym)
-    calc_date = replay_date if replay_date else None; calc_tag = session
-    if calc_date and not calc_tag: calc_tag = get_latest_tag_for_date(display_ticker, calc_date)
-    
-    # FETCH DATA (Includes Spot Price & Greeks now)
-    raw_data = fetch_and_enrich_chain(
-        ticker=ticker, 
-        expiry_date=target_expiry, 
-        snapshot_date=calc_date, 
-        snapshot_tag=calc_tag, 
-        scope=scope
-    )
-    
-    if not raw_data: 
-        await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True); return
+    try: # <--- SAFETY WRAPPER START
+        yf_sym = resolve_yf_symbol(ticker); display_ticker = get_options_ticker(yf_sym)
+        calc_date = replay_date if replay_date else None; calc_tag = session
+        if calc_date and not calc_tag: calc_tag = get_latest_tag_for_date(display_ticker, calc_date)
+        
+        # FETCH DATA (Includes Spot Price & Greeks now)
+        raw_data = fetch_and_enrich_chain(
+            ticker=ticker, 
+            expiry_date=target_expiry, 
+            snapshot_date=calc_date, 
+            snapshot_tag=calc_tag, 
+            scope=scope
+        )
+        
+        if not raw_data: 
+            await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True); return
 
-    # CALCULATION
-    spot_price = raw_data[0]['spot'] # Now safe
-    gex, dex, vex = calculate_market_exposures(raw_data, spot_price)
-    
-    # VISUALIZATION
-    view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
-    if target_expiry: label = f"EXP: {target_expiry}"
-    elif replay_date: label = f"REPLAY: {replay_date} ({scope})"
-    else: label = f"LIVE: {scope}"
+        # CALCULATION
+        spot_price = raw_data[0]['spot'] # Now safe
+        gex, dex, vex = calculate_market_exposures(raw_data, spot_price)
+        
+        # VISUALIZATION
+        view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
+        if target_expiry: label = f"EXP: {target_expiry}"
+        elif replay_date: label = f"REPLAY: {replay_date} ({scope})"
+        else: label = f"LIVE: {scope}"
 
-    if view_setting == 'modern':
-        img_buf = generate_exposure_dashboard(display_ticker, spot_price, gex, dex, vex, label, None)
-        file = discord.File(img_buf, filename="beeks_exposures.png"); embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_exposures.png"); await ctx.respond(embed=embed, file=file, ephemeral=True)
-    else:
-        def fmt(v, s="B"): d=1_000_000_000 if s=="B" else 1_000_000; return f"${v/d:>7.2f} {s}"
-        msg = f"> **{quote}**\n```yaml\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| CLARENCE BEEKS TERMINAL           [EXPOSURE]     |\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| TICKER: {display_ticker:<16} SPOT: {spot_price:<15.2f} |\n"; msg += f"| SCOPE:  {label:<32} |\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| DEX (DELTA)   : {fmt(dex, 'B'):<12} Net Notional   |\n"; msg += f"| GEX (GAMMA)   : {fmt(gex, 'B'):<12} / 1% Move      |\n"; msg += f"| VEX (VANNA)   : {fmt(vex, 'M'):<12} / 1% IV Change |\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| REGIME: {'DAMPENED VOL (Stable)' if gex > 0 else 'ACCELERATED VOL (Unstable)':<32} |\n"; msg += f"+--------------------------------------------------+\n```"; await ctx.respond(msg, ephemeral=True)
+        if view_setting == 'modern':
+            img_buf = generate_exposure_dashboard(display_ticker, spot_price, gex, dex, vex, label, None)
+            file = discord.File(img_buf, filename="beeks_exposures.png"); embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_exposures.png"); await ctx.respond(embed=embed, file=file, ephemeral=True)
+        else:
+            def fmt(v, s="B"): d=1_000_000_000 if s=="B" else 1_000_000; return f"${v/d:>7.2f} {s}"
+            msg = f"> **{quote}**\n```yaml\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| CLARENCE BEEKS TERMINAL           [EXPOSURE]     |\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| TICKER: {display_ticker:<16} SPOT: {spot_price:<15.2f} |\n"; msg += f"| SCOPE:  {label:<32} |\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| DEX (DELTA)   : {fmt(dex, 'B'):<12} Net Notional   |\n"; msg += f"| GEX (GAMMA)   : {fmt(gex, 'B'):<12} / 1% Move      |\n"; msg += f"| VEX (VANNA)   : {fmt(vex, 'M'):<12} / 1% IV Change |\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| REGIME: {'DAMPENED VOL (Stable)' if gex > 0 else 'ACCELERATED VOL (Unstable)':<32} |\n"; msg += f"+--------------------------------------------------+\n```"; await ctx.respond(msg, ephemeral=True)
+            
+    except Exception as e:
+        await ctx.respond(f"⚠️ **Beeks:** 'Exposure Calculation Failed: {e}'", ephemeral=True)
 
 @dom_group.command(name="flip", description="Find the Gamma Flip Level (Zero Gamma)")
 async def dom_flip(
@@ -1576,46 +1580,51 @@ async def dom_flip(
     session: Option(str, autocomplete=get_db_tags, required=False)
 ):
     await ctx.defer(ephemeral=True)
-    yf_sym = resolve_yf_symbol(ticker); display_ticker = get_options_ticker(yf_sym)
-    calc_date = replay_date if replay_date else None; calc_tag = session
-    if calc_date and not calc_tag: calc_tag = get_latest_tag_for_date(display_ticker, calc_date)
-    
-    # Scope is always Front Month for Flip
-    scope_label = "Front Month" if not target_expiry else f"Exp: {target_expiry}"
+    try: # <--- SAFETY WRAPPER START
+        yf_sym = resolve_yf_symbol(ticker); display_ticker = get_options_ticker(yf_sym)
+        calc_date = replay_date if replay_date else None; calc_tag = session
+        if calc_date and not calc_tag: calc_tag = get_latest_tag_for_date(display_ticker, calc_date)
+        
+        # Scope is always Front Month for Flip
+        scope_label = "Front Month" if not target_expiry else f"Exp: {target_expiry}"
 
-    raw_data = fetch_and_enrich_chain(ticker, target_expiry, calc_date, calc_tag, scope="Front Month")
-    if not raw_data: await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True); return
+        raw_data = fetch_and_enrich_chain(ticker, target_expiry, calc_date, calc_tag, scope="Front Month")
+        if not raw_data: 
+            await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True)
+            return
 
-    spot = raw_data[0]['spot']
-    flip_level, sim_data = calculate_gamma_flip(raw_data, spot)
-    
-    # Calculation for display
-    status = "NEUTRAL"
-    dist_str = "N/A"
-    if flip_level:
-        dist = ((spot - flip_level) / flip_level) * 100
-        dist_str = f"{dist:+.1f}%"
-        status = "POSITIVE GAMMA (Stable)" if spot > flip_level else "NEGATIVE GAMMA (Volatile)"
+        spot = raw_data[0]['spot']
+        flip_level, sim_data = calculate_gamma_flip(raw_data, spot)
+        
+        status = "NEUTRAL"
+        dist_str = "N/A"
+        if flip_level:
+            dist = ((spot - flip_level) / flip_level) * 100
+            dist_str = f"{dist:+.1f}%"
+            status = "POSITIVE GAMMA (Stable)" if spot > flip_level else "NEGATIVE GAMMA (Volatile)"
 
-    view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
+        view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
 
-    if view_setting == 'modern' and sim_data:
-        # IMAGE VIEW
-        img_buf = generate_flip_chart(display_ticker, spot, flip_level, sim_data[0], sim_data[1], scope_label)
-        file = discord.File(img_buf, filename="beeks_flip.png")
-        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_flip.png")
-        await ctx.respond(embed=embed, file=file, ephemeral=True)
-    else:
-        # BLOOMBERG VIEW (Enhanced)
-        msg = f"> **{quote}**\n```yaml\n"
-        msg += f"[{display_ticker} GAMMA FLIP ANALYSIS]\n"
-        msg += f"SCOPE : {scope_label}\n"
-        msg += f"SPOT  : {spot:.2f}\n"
-        msg += "-" * 30 + "\n"
-        msg += f"FLIP  : {flip_level:.2f} ({dist_str})\n" if flip_level else "FLIP  : UNDEFINED\n"
-        msg += f"MODE  : {status}\n"
-        msg += f"```"
-        await ctx.respond(msg, ephemeral=True)
+        if view_setting == 'modern' and sim_data:
+            # IMAGE VIEW
+            img_buf = generate_flip_chart(display_ticker, spot, flip_level, sim_data[0], sim_data[1], scope_label)
+            file = discord.File(img_buf, filename="beeks_flip.png")
+            embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_flip.png")
+            await ctx.respond(embed=embed, file=file, ephemeral=True)
+        else:
+            # BLOOMBERG VIEW (Enhanced)
+            msg = f"> **{quote}**\n```yaml\n"
+            msg += f"[{display_ticker} GAMMA FLIP ANALYSIS]\n"
+            msg += f"SCOPE : {scope_label}\n"
+            msg += f"SPOT  : {spot:.2f}\n"
+            msg += "-" * 30 + "\n"
+            msg += f"FLIP  : {flip_level:.2f} ({dist_str})\n" if flip_level else "FLIP  : UNDEFINED\n"
+            msg += f"MODE  : {status}\n"
+            msg += f"```"
+            await ctx.respond(msg, ephemeral=True)
+            
+    except Exception as e:
+        await ctx.respond(f"⚠️ **Beeks:** 'Flip Calculation Failed: {e}'", ephemeral=True)
 
 @dom_group.command(name="vig", description="Calculate Intraday Expected Move (ATM Straddle)")
 async def dom_vig(
@@ -1685,40 +1694,54 @@ async def dom_skew(
     session: Option(str, autocomplete=get_db_tags, required=False)
 ):
     await ctx.defer(ephemeral=True)
-    scope_label = "Front Month" if not target_expiry else f"Exp: {target_expiry}"
-    data = fetch_and_enrich_chain(ticker, target_expiry, replay_date, session, scope="Front Month")
-    if not data: await ctx.respond("❌ **Beeks:** 'Data Dark.'", ephemeral=True); return
-    
-    spot = data[0]['spot']
-    calls = [x for x in data if x['type'] == 'Call']; puts = [x for x in data if x['type'] == 'Put']
-    c_25 = min(calls, key=lambda x: abs(x['delta'] - 0.25)) if calls else None
-    p_25 = min(puts, key=lambda x: abs(abs(x['delta']) - 0.25)) if puts else None
-    
-    if not c_25 or not p_25: await ctx.respond("❌ **Beeks:** 'Cannot find 25-Delta Wings.'", ephemeral=True); return
-    
-    ratio = p_25['iv'] / c_25['iv'] if c_25['iv'] > 0 else 0
-    status = "BEARISH (High Fear)" if ratio > 1.1 else "BULLISH (Call Demand)" if ratio < 0.9 else "NEUTRAL"
-    
-    view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
-    display_ticker = get_options_ticker(ticker)
+    try: # <--- SAFETY WRAPPER START
+        scope_label = "Front Month" if not target_expiry else f"Exp: {target_expiry}"
+        data = fetch_and_enrich_chain(ticker, target_expiry, replay_date, session, scope="Front Month")
+        if not data: 
+            await ctx.respond("❌ **Beeks:** 'Data Dark.'", ephemeral=True)
+            return
+        
+        spot = data[0]['spot']
+        calls = [x for x in data if x['type'] == 'Call']; puts = [x for x in data if x['type'] == 'Put']
+        
+        # Check if lists are valid before processing
+        if not calls or not puts:
+            await ctx.respond("❌ **Beeks:** 'Missing call/put data.'", ephemeral=True)
+            return
 
-    if view_setting == 'modern':
-        # IMAGE VIEW
-        img_buf = generate_skew_chart(display_ticker, spot, c_25['iv'], p_25['iv'], ratio, scope_label)
-        file = discord.File(img_buf, filename="beeks_skew.png")
-        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_skew.png")
-        await ctx.respond(embed=embed, file=file, ephemeral=True)
-    else:
-        # BLOOMBERG VIEW (Enhanced)
-        msg = f"> **{quote}**\n```yaml\n"
-        msg += f"[{display_ticker} 25-DELTA SKEW]\n"
-        msg += f"SCOPE : {scope_label}\n"
-        msg += f"SPOT  : {spot:.2f}\n"
-        msg += "-" * 30 + "\n"
-        msg += f"P-IV  : {p_25['iv']:.1%} (Strike: {p_25['strike']})\n"
-        msg += f"C-IV  : {c_25['iv']:.1%} (Strike: {c_25['strike']})\n"
-        msg += f"RATIO : {ratio:.2f}x ({status})\n```"
-        await ctx.respond(msg, ephemeral=True)
+        c_25 = min(calls, key=lambda x: abs(x['delta'] - 0.25)) if calls else None
+        p_25 = min(puts, key=lambda x: abs(abs(x['delta']) - 0.25)) if puts else None
+        
+        if not c_25 or not p_25: 
+            await ctx.respond("❌ **Beeks:** 'Cannot find 25-Delta Wings.'", ephemeral=True)
+            return
+        
+        ratio = p_25['iv'] / c_25['iv'] if c_25['iv'] > 0 else 0
+        status = "BEARISH (High Fear)" if ratio > 1.1 else "BULLISH (Call Demand)" if ratio < 0.9 else "NEUTRAL"
+        
+        view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
+        display_ticker = get_options_ticker(ticker)
+
+        if view_setting == 'modern':
+            # IMAGE VIEW
+            img_buf = generate_skew_chart(display_ticker, spot, c_25['iv'], p_25['iv'], ratio, scope_label)
+            file = discord.File(img_buf, filename="beeks_skew.png")
+            embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_skew.png")
+            await ctx.respond(embed=embed, file=file, ephemeral=True)
+        else:
+            # BLOOMBERG VIEW (Enhanced)
+            msg = f"> **{quote}**\n```yaml\n"
+            msg += f"[{display_ticker} 25-DELTA SKEW]\n"
+            msg += f"SCOPE : {scope_label}\n"
+            msg += f"SPOT  : {spot:.2f}\n"
+            msg += "-" * 30 + "\n"
+            msg += f"P-IV  : {p_25['iv']:.1%} (Strike: {p_25['strike']})\n"
+            msg += f"C-IV  : {c_25['iv']:.1%} (Strike: {c_25['strike']})\n"
+            msg += f"RATIO : {ratio:.2f}x ({status})\n```"
+            await ctx.respond(msg, ephemeral=True)
+            
+    except Exception as e:
+        await ctx.respond(f"⚠️ **Beeks:** 'Skew Calculation Failed: {e}'", ephemeral=True)
 
 @dom_group.command(name="pcr", description="Put/Call Ratio & Max Pain")
 async def dom_pcr(

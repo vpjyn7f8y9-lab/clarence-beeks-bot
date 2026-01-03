@@ -26,6 +26,15 @@ from matplotlib.patches import Rectangle, Patch
 # --- CONFIGURATION ---
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN") 
+PROXY_URL = os.getenv("PROXY_URL")
+
+# Apply Proxy if it exists in .env
+if PROXY_URL:
+    os.environ["HTTP_PROXY"] = PROXY_URL
+    os.environ["HTTPS_PROXY"] = PROXY_URL
+    print(f"🔒 Proxy Loaded: {PROXY_URL.split('@')[-1]}") # Prints just the host:port for privacy
+else:
+    print("⚠️ No Proxy Configured. Running Raw IP.")
 
 # --- BEEKS QUOTES ---
 MOVIE_QUOTES = [

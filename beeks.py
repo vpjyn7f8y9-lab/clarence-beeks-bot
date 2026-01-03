@@ -1802,6 +1802,9 @@ async def dom_pcr(
         
         # FIX: Use helper and handle None
         max_pain = calculate_max_pain(data)
+
+        if max_pain is not None and pd.isna(max_pain):
+            max_pain = None
         
         # NOTE: For the image generator, we pass 0 if None to prevent a crash in 'int()'.
         # To see "N/A" on the image, we must update 'generate_pcr_dashboard' next.

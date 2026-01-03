@@ -1168,60 +1168,76 @@ async def beeks_dailyrange(
     session: Option(str, autocomplete=get_db_tags, required=False)
 ):
     await ctx.defer(ephemeral=True)
-    raw_ticker = ticker.upper(); yf_sym = resolve_yf_symbol(raw_ticker)
-    FUTURES_MAP = {"ES": "ES=F", "NQ": "NQ=F", "YM": "YM=F", "RTY": "RTY=F"}; is_future = raw_ticker in FUTURES_MAP; futures_ticker = FUTURES_MAP.get(raw_ticker)
-    
-    if replay_date:
-        tag_to_use = session if session and "Select" not in session else get_latest_tag_for_date(get_options_ticker(yf_sym), replay_date)
-        data = fetch_historical_data(yf_sym, replay_date, tag_to_use)
-        if not data: await ctx.respond(f"❌ **Beeks:** 'File not found.'", ephemeral=True); return
-        clean_footer = f"📼 REPLAY: {replay_date} [{tag_to_use}]"; movie_quote = random.choice(MOVIE_QUOTES)
-        # Replays always anchor to the saved price (usually Close/Spot of that moment)
-        anchor_label = "SNAPSHOT" 
-    else:
-        if not (yf_sym in ["^GSPC", "^NDX"] or is_future or (not yf_sym.startswith("^") and not yf_sym.endswith("=F"))): await ctx.respond(f"❌ **Beeks:** 'Incompatible Ticker.'", ephemeral=True); return
-        data = fetch_market_data(yf_sym)
-        if not data: await ctx.respond(f"❌ **Beeks:** 'Data corrupted.'", ephemeral=True); return
-        movie_quote = random.choice(MOVIE_QUOTES)
+    try: # <--- SAFETY WRAPPER START
+        raw_ticker = ticker.upper(); yf_sym = resolve_yf_symbol(raw_ticker)
+        FUTURES_MAP = {"ES": "ES=F", "NQ": "NQ=F", "YM": "YM=F", "RTY": "RTY=F"}; is_future = raw_ticker in FUTURES_MAP; futures_ticker = FUTURES_MAP.get(raw_ticker)
         
-        ny_tz = pytz.timezone('America/New_York'); ny_now = datetime.datetime.now(ny_tz)
-        
-        # --- NEW LABEL LOGIC ---
-        # We trust the data packet to tell us what price it used
-        anchor_label = data.get('anchor_type', "REF")
-        clean_footer = f"NY TIME: {ny_now.strftime('%H:%M')} ET | REF: {anchor_label}"
-        if 'saved_at' in data: clean_footer = f"⚠️ ARCHIVE DATA | {data['saved_at']}"
+        if replay_date:
+            tag_to_use = session if session and "Select" not in session else get_latest_tag_for_date(get_options_ticker(yf_sym), replay_date)
+            data = fetch_historical_data(yf_sym, replay_date, tag_to_use)
+            if not data: 
+                await ctx.respond(f"❌ **Beeks:** 'File not found.'", ephemeral=True)
+                return
+            clean_footer = f"📼 REPLAY: {replay_date} [{tag_to_use}]"; movie_quote = random.choice(MOVIE_QUOTES)
+            anchor_label = "SNAPSHOT" 
+        else:
+            if not (yf_sym in ["^GSPC", "^NDX"] or is_future or (not yf_sym.startswith("^") and not yf_sym.endswith("=F"))): 
+                await ctx.respond(f"❌ **Beeks:** 'Incompatible Ticker.'", ephemeral=True)
+                return
+            
+            data = fetch_market_data(yf_sym)
+            if not data: 
+                await ctx.respond(f"❌ **Beeks:** 'Data corrupted.'", ephemeral=True)
+                return
+            
+            movie_quote = random.choice(MOVIE_QUOTES)
+            
+            ny_tz = pytz.timezone('America/New_York'); ny_now = datetime.datetime.now(ny_tz)
+            anchor_label = data.get('anchor_type', "REF")
+            clean_footer = f"NY TIME: {ny_now.strftime('%H:%M')} ET | REF: {anchor_label}"
+            if 'saved_at' in data: clean_footer = f"⚠️ ARCHIVE DATA | {data['saved_at']}"
 
-    levels = calculate_levels(data['anchor_price'], data['iv'], data['hv'], engine)
-    display_price = data['anchor_price']
-    
-    # Futures Offset Logic
-    if is_future and not replay_date:
-        try:
-            ft = yf.Ticker(futures_ticker); spx = yf.Ticker(yf_sym); f_hist = ft.history(period="5d"); s_hist = spx.history(period="5d")
-            if len(f_hist) >= 2 and len(s_hist) >= 2:
-                offset = f_hist['Close'].iloc[-2] - s_hist['Close'].iloc[-2]; display_price += offset
-                for key in levels['valentine']: levels['valentine'][key] += offset
-                for key in levels['winthorpe']: levels['winthorpe'][key] += offset
-                clean_footer += " | OFFSET IN USE"
-        except: pass
+        levels = calculate_levels(data['anchor_price'], data['iv'], data['hv'], engine)
+        display_price = data['anchor_price']
         
-    chart_data = data.copy(); chart_data['anchor_price'] = display_price
-    view_setting = get_user_terminal_setting(ctx.author.id) 
-    
-    if view_setting == "bloomberg":
-        msg = f"> **{movie_quote}**\n\n**{raw_ticker} VOLATILITY REPORT ({engine})**\n\n`{'RANGE':<12} | {'VALUE':<12} | {'MOVE':<12} | {'TYPE':<12}\n" + "-"*56 + "\n"
-        msg += f"{'IV':<12} | {data['iv']:<12.4f} | {levels['meta']['daily_move_iv']:<12.2f} | {'Implied'}\n{'HV':<12} | {data['hv']:<12.4f} | {levels['meta']['daily_move_hv']:<12.2f} | {'Historical'}\n`\n\n**{raw_ticker} LEVELS**\n`{'LEVEL':<12} | {'VALENTINE':<15} | {'WINTHORPE':<15}\n" + "-"*48 + "\n"
-        for i in range(4, 0, -1): msg += f"+{i}σ          | {levels['valentine'][f'+{i}σ']:<15.2f} | {levels['winthorpe'][f'+{i}σ']:<15.2f}\n" 
-        msg += f"{anchor_label:<12} | {display_price:.2f}\n" 
-        for i in range(1, 5): msg += f"-{i}σ          | {levels['valentine'][f'-{i}σ']:<15.2f} | {levels['winthorpe'][f'-{i}σ']:<15.2f}\n" 
-        msg += f"`\n*{clean_footer}*"
-        await ctx.respond(msg, ephemeral=True)
-    else: 
-        buf = create_beeks_chart(raw_ticker, chart_data, levels, engine)
-        file = discord.File(buf, filename="beeks_dailyrange.png")
-        embed = discord.Embed(description=f"**{movie_quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_dailyrange.png"); embed.set_footer(text=clean_footer)
-        await ctx.respond(embed=embed, file=file, ephemeral=True)
+        # Futures Offset Logic
+        if is_future and not replay_date:
+            try:
+                ft = yf.Ticker(futures_ticker); spx = yf.Ticker(yf_sym); f_hist = ft.history(period="5d"); s_hist = spx.history(period="5d")
+                if len(f_hist) >= 2 and len(s_hist) >= 2:
+                    offset = f_hist['Close'].iloc[-2] - s_hist['Close'].iloc[-2]; display_price += offset
+                    for key in levels['valentine']: levels['valentine'][key] += offset
+                    for key in levels['winthorpe']: levels['winthorpe'][key] += offset
+                    clean_footer += " | OFFSET IN USE"
+            except: pass
+            
+        chart_data = data.copy(); chart_data['anchor_price'] = display_price
+        view_setting = get_user_terminal_setting(ctx.author.id) 
+        
+        # FIX: Define response logic in a variable to allow fallback
+        should_send_text = (view_setting == "bloomberg")
+        
+        if not should_send_text:
+            try:
+                buf = create_beeks_chart(raw_ticker, chart_data, levels, engine)
+                file = discord.File(buf, filename="beeks_dailyrange.png")
+                embed = discord.Embed(description=f"**{movie_quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_dailyrange.png"); embed.set_footer(text=clean_footer)
+                await ctx.respond(embed=embed, file=file, ephemeral=True)
+            except:
+                # If charting fails, force text mode
+                should_send_text = True
+
+        if should_send_text:
+            msg = f"> **{movie_quote}**\n\n**{raw_ticker} VOLATILITY REPORT ({engine})**\n\n`{'RANGE':<12} | {'VALUE':<12} | {'MOVE':<12} | {'TYPE':<12}\n" + "-"*56 + "\n"
+            msg += f"{'IV':<12} | {data['iv']:<12.4f} | {levels['meta']['daily_move_iv']:<12.2f} | {'Implied'}\n{'HV':<12} | {data['hv']:<12.4f} | {levels['meta']['daily_move_hv']:<12.2f} | {'Historical'}\n`\n\n**{raw_ticker} LEVELS**\n`{'LEVEL':<12} | {'VALENTINE':<15} | {'WINTHORPE':<15}\n" + "-"*48 + "\n"
+            for i in range(4, 0, -1): msg += f"+{i}σ           | {levels['valentine'][f'+{i}σ']:<15.2f} | {levels['winthorpe'][f'+{i}σ']:<15.2f}\n" 
+            msg += f"{anchor_label:<12} | {display_price:.2f}\n" 
+            for i in range(1, 5): msg += f"-{i}σ           | {levels['valentine'][f'-{i}σ']:<15.2f} | {levels['winthorpe'][f'-{i}σ']:<15.2f}\n" 
+            msg += f"`\n*{clean_footer}*"
+            await ctx.respond(msg, ephemeral=True)
+
+    except Exception as e:
+        await ctx.respond(f"⚠️ **Beeks:** 'Range Analysis Failed: {e}'", ephemeral=True)
 
 @beeks.command(name="dailylevels", description="Key Dealer GEX Levels & Volatility")
 async def daily_levels(

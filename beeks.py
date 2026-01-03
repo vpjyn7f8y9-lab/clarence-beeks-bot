@@ -1227,92 +1227,108 @@ async def beeks_dailyrange(
 async def daily_levels(
     ctx: discord.ApplicationContext, 
     ticker: Option(str, required=True), 
-    metric: Option(str, choices=["ALL", "CONFLUENCE", "GEX", "DEX", "VEX", "CEX"], default="ALL"), # <--- RESTORED
+    metric: Option(str, choices=["ALL", "CONFLUENCE", "DEX", "GEX", "VEX", "CEX"], default="ALL"), 
     scope: Option(str, choices=["0DTE", "Front Month", "Total Market"], default="0DTE"),
     target_expiry: Option(str, description="Override Scope (Format: YYYY-MM-DD)", required=False), 
     replay_date: Option(str, description="Historical Snapshot (Select from list)", autocomplete=get_db_dates, required=False), 
     session: Option(str, autocomplete=get_db_tags, required=False)
 ):
     await ctx.defer(ephemeral=True)
-    yf_sym = resolve_yf_symbol(ticker); display_ticker = get_options_ticker(yf_sym)
-    calc_date = None; calc_tag = session; market_time = datetime.datetime.now(ZoneInfo("America/New_York"))
-    
-    # Date Logic
-    if target_expiry: target_date = target_expiry; calc_date = replay_date if replay_date else None
-    elif scope == "0DTE" and not replay_date:
-        target_date = market_time.strftime("%Y-%m-%d") if market_time.weekday() <= 4 and market_time.hour < 16 else get_next_market_date(market_time)
-        # Check if we should use DB for today (e.g. after close)
-        conn = sqlite3.connect("beeks.db"); c = conn.cursor(); c.execute("SELECT date(timestamp) FROM chain_snapshots WHERE ticker = ? AND tag = 'CLOSE' ORDER BY timestamp DESC LIMIT 1", (display_ticker,)); row = c.fetchone(); conn.close()
-        if row and row[0] == target_date: calc_date = row[0]; calc_tag = "CLOSE"
-    elif replay_date: calc_date = replay_date; target_date = replay_date
-    else: target_date = None
-
-    await ctx.interaction.edit_original_response(content=f"⏳ **Beeks:** 'Mapping {metric}...'")
-    
-    # Fetch Data
-    raw_data = fetch_and_enrich_chain(ticker=ticker, expiry_date=target_date, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope, range_count=9999)
-    if not raw_data: await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'"); return
-    
-    spot_price = raw_data[0]['spot']; strike_data = calculate_strike_exposures(raw_data, spot_price, display_ticker)
-    
-    # Confluence Calc
-    def get_top(vals): return {x[0] for x in sorted([p for p in zip(strike_data['strikes'], vals) if abs(p[1])>0], key=lambda x: abs(x[1]), reverse=True)[:5]}
-    all_sig = get_top(strike_data['gex']) | get_top(strike_data['dex']) | get_top(strike_data['vex']) | get_top(strike_data['cex'])
-    confluence_map = []
-    for k in all_sig:
-        score = (1 if k in get_top(strike_data['gex']) else 0) + (1 if k in get_top(strike_data['dex']) else 0) + (1 if k in get_top(strike_data['vex']) else 0) + (1 if k in get_top(strike_data['cex']) else 0)
-        tags = ("D" if k in get_top(strike_data['dex']) else "") + ("G" if k in get_top(strike_data['gex']) else "") + ("V" if k in get_top(strike_data['vex']) else "") + ("C" if k in get_top(strike_data['cex']) else "")
-        confluence_map.append({'strike': k, 'score': score, 'tags': tags})
-    confluence_map.sort(key=lambda x: (x['score'], x['strike']), reverse=True)
-
-    view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
-    
-    # VISUALIZATION
-    if view_setting == 'modern':
-        img_buf = generate_strike_chart(display_ticker, spot_price, strike_data, metric, confluence_map)
-        file = discord.File(img_buf, filename="beeks_strikes.png")
-        desc = f"**{quote}**\n" + (f"\n**🎯 CONFLUENCE (Top 5)**\n" + "\n".join([f"`{int(i['strike']):<5}` {'⭐'*i['score']} ({i['tags']})" for i in confluence_map[:5]]) if metric == "CONFLUENCE" else "")
-        embed = discord.Embed(color=0x2b2d31, description=desc); embed.set_image(url="attachment://beeks_strikes.png"); embed.set_footer(text=f"Spot: {spot_price:.2f} | {scope}")
-        await ctx.interaction.edit_original_response(content="", embed=embed, file=file)
-    else:
-        # Text Mode
-        lines = [f"> **{quote}**"]
-        def fmt(n):
-            if abs(n) >= 1_000_000_000: return f"{n/1_000_000_000:.1f}B"
-            if abs(n) >= 1_000_000: return f"{n/1_000_000:.1f}M"
-            if abs(n) >= 1_000: return f"{n/1_000:.0f}K"
-            return f"{n:.0f}"
-
-        if metric == "CONFLUENCE":
-            lines += ["```yaml", f"SPOT REF: {spot_price:.2f}", "+---------------------------------------+", "| KEY LEVELS (HIGHEST OVERLAP)          |", "+---------------------------------------+"]
-            for i in confluence_map: lines.append(f"| {int(i['strike']):<7} | {'*'*i['score']:<4} | {i['tags']:<5} |")
-            lines.append("```")
+    try: # <--- SAFETY WRAPPER START
+        yf_sym = resolve_yf_symbol(ticker); display_ticker = get_options_ticker(yf_sym)
+        calc_date = None; calc_tag = session; market_time = datetime.datetime.now(ZoneInfo("America/New_York"))
         
-        else:
-            s_list = strike_data['strikes']
-            closest_idx = min(range(len(s_list)), key=lambda i: abs(s_list[i]-spot_price))
-            start = max(0, closest_idx - 10); end = min(len(s_list), closest_idx + 11)
+        # Date Logic
+        if target_expiry: target_date = target_expiry; calc_date = replay_date if replay_date else None
+        elif scope == "0DTE" and not replay_date:
+            target_date = market_time.strftime("%Y-%m-%d") if market_time.weekday() <= 4 and market_time.hour < 16 else get_next_market_date(market_time)
+            # Check if we should use DB for today (e.g. after close)
+            conn = sqlite3.connect("beeks.db"); c = conn.cursor(); c.execute("SELECT date(timestamp) FROM chain_snapshots WHERE ticker = ? AND tag = 'CLOSE' ORDER BY timestamp DESC LIMIT 1", (display_ticker,)); row = c.fetchone(); conn.close()
+            if row and row[0] == target_date: calc_date = row[0]; calc_tag = "CLOSE"
+        elif replay_date: calc_date = replay_date; target_date = replay_date
+        else: target_date = None
+
+        await ctx.interaction.edit_original_response(content=f"⏳ **Beeks:** 'Mapping {metric}...'")
+        
+        # Fetch Data
+        raw_data = fetch_and_enrich_chain(ticker=ticker, expiry_date=target_date, snapshot_date=calc_date, snapshot_tag=calc_tag, scope=scope, range_count=9999)
+        if not raw_data: 
+            await ctx.interaction.edit_original_response(content=f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'")
+            return
+        
+        spot_price = raw_data[0]['spot']; strike_data = calculate_strike_exposures(raw_data, spot_price, display_ticker)
+        
+        # Confluence Calc
+        def get_top(vals): return {x[0] for x in sorted([p for p in zip(strike_data['strikes'], vals) if abs(p[1])>0], key=lambda x: abs(x[1]), reverse=True)[:5]}
+        all_sig = get_top(strike_data['gex']) | get_top(strike_data['dex']) | get_top(strike_data['vex']) | get_top(strike_data['cex'])
+        confluence_map = []
+        for k in all_sig:
+            score = (1 if k in get_top(strike_data['gex']) else 0) + (1 if k in get_top(strike_data['dex']) else 0) + (1 if k in get_top(strike_data['vex']) else 0) + (1 if k in get_top(strike_data['cex']) else 0)
+            tags = ("D" if k in get_top(strike_data['dex']) else "") + ("G" if k in get_top(strike_data['gex']) else "") + ("V" if k in get_top(strike_data['vex']) else "") + ("C" if k in get_top(strike_data['cex']) else "")
+            confluence_map.append({'strike': k, 'score': score, 'tags': tags})
+        confluence_map.sort(key=lambda x: (x['score'], x['strike']), reverse=True)
+
+        view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
+        
+        # VISUALIZATION
+        if view_setting == 'modern':
+            img_buf = generate_strike_chart(display_ticker, spot_price, strike_data, metric, confluence_map)
             
-            lines.append("```yaml")
-            if metric == "ALL":
-                lines.append(f"|{'STRIKE':^8}|{'GEX':^7}|{'DEX':^7}|{'VEX':^7}|")
-                lines.append("-" * 32)
+            # FIX: Check if chart generation failed (returned None)
+            if not img_buf:
+                await ctx.interaction.edit_original_response(content="❌ **Beeks:** 'Not enough data to map levels.'")
+                return
+
+            file = discord.File(img_buf, filename="beeks_strikes.png")
+            desc = f"**{quote}**\n" + (f"\n**🎯 CONFLUENCE (Top 5)**\n" + "\n".join([f"`{int(i['strike']):<5}` {'⭐'*i['score']} ({i['tags']})" for i in confluence_map[:5]]) if metric == "CONFLUENCE" else "")
+            embed = discord.Embed(color=0x2b2d31, description=desc); embed.set_image(url="attachment://beeks_strikes.png"); embed.set_footer(text=f"Spot: {spot_price:.2f} | {scope}")
+            await ctx.interaction.edit_original_response(content="", embed=embed, file=file)
+        else:
+            # Text Mode
+            lines = [f"> **{quote}**"]
+            def fmt(n):
+                if abs(n) >= 1_000_000_000: return f"{n/1_000_000_000:.1f}B"
+                if abs(n) >= 1_000_000: return f"{n/1_000_000:.1f}M"
+                if abs(n) >= 1_000: return f"{n/1_000:.0f}K"
+                return f"{n:.0f}"
+
+            if metric == "CONFLUENCE":
+                lines += ["```yaml", f"SPOT REF: {spot_price:.2f}", "+---------------------------------------+", "| KEY LEVELS (HIGHEST OVERLAP)          |", "+---------------------------------------+"]
+                for i in confluence_map: lines.append(f"| {int(i['strike']):<7} | {'*'*i['score']:<4} | {i['tags']:<5} |")
+                lines.append("```")
+            
             else:
-                lines.append(f"|{'STRIKE':^8}|{metric:^10}|")
-                lines.append("-" * 20)
+                s_list = strike_data['strikes']
+                # FIX: Verify list is not empty before indexing
+                if not s_list:
+                    await ctx.interaction.edit_original_response(content="❌ **Beeks:** 'No strikes found.'")
+                    return
 
-            for i in range(start, end):
-                k = s_list[i]; prefix = ">" if i == closest_idx else " "
+                closest_idx = min(range(len(s_list)), key=lambda i: abs(s_list[i]-spot_price))
+                start = max(0, closest_idx - 10); end = min(len(s_list), closest_idx + 11)
+                
+                lines.append("```yaml")
                 if metric == "ALL":
-                    g = fmt(strike_data['gex'][i]); d = fmt(strike_data['dex'][i]); v = fmt(strike_data['vex'][i])
-                    lines.append(f"{prefix}|{int(k):<7}|{g:>7}|{d:>7}|{v:>7}|")
+                    lines.append(f"|{'STRIKE':^8}|{'GEX':^7}|{'DEX':^7}|{'VEX':^7}|")
+                    lines.append("-" * 32)
                 else:
-                    val = fmt(strike_data[metric.lower()][i])
-                    lines.append(f"{prefix}|{int(k):<7}|{val:>10}|")
-            lines.append("```"); lines.append(f"**Spot:** {spot_price:.2f} | **Range:** ±10 Strikes")
+                    lines.append(f"|{'STRIKE':^8}|{metric:^10}|")
+                    lines.append("-" * 20)
 
-        await ctx.interaction.edit_original_response(content="\n".join(lines))
+                for i in range(start, end):
+                    k = s_list[i]; prefix = ">" if i == closest_idx else " "
+                    if metric == "ALL":
+                        g = fmt(strike_data['gex'][i]); d = fmt(strike_data['dex'][i]); v = fmt(strike_data['vex'][i])
+                        lines.append(f"{prefix}|{int(k):<7}|{g:>7}|{d:>7}|{v:>7}|")
+                    else:
+                        val = fmt(strike_data[metric.lower()][i])
+                        lines.append(f"{prefix}|{int(k):<7}|{val:>10}|")
+                lines.append("```"); lines.append(f"**Spot:** {spot_price:.2f} | **Range:** ±10 Strikes")
 
+            await ctx.interaction.edit_original_response(content="\n".join(lines))
+            
+    except Exception as e:
+        await ctx.interaction.edit_original_response(content=f"⚠️ **Beeks:** 'Level Mapping Failed: {e}'")
 @beeks.command(name="chain", description="View Raw Chain")
 async def beeks_chain(
     ctx: discord.ApplicationContext, 

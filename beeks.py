@@ -1214,8 +1214,9 @@ async def beeks_dailyrange(
         chart_data = data.copy(); chart_data['anchor_price'] = display_price
         view_setting = get_user_terminal_setting(ctx.author.id) 
         
-        # FIX: Define response logic in a variable to allow fallback
+        # Logic to handle fallback
         should_send_text = (view_setting == "bloomberg")
+        forced_fallback = False
         
         if not should_send_text:
             try:
@@ -1224,11 +1225,16 @@ async def beeks_dailyrange(
                 embed = discord.Embed(description=f"**{movie_quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_dailyrange.png"); embed.set_footer(text=clean_footer)
                 await ctx.respond(embed=embed, file=file, ephemeral=True)
             except:
-                # If charting fails, force text mode
+                # If charting fails, force text mode and flag it
                 should_send_text = True
+                forced_fallback = True
 
         if should_send_text:
-            msg = f"> **{movie_quote}**\n\n**{raw_ticker} VOLATILITY REPORT ({engine})**\n\n`{'RANGE':<12} | {'VALUE':<12} | {'MOVE':<12} | {'TYPE':<12}\n" + "-"*56 + "\n"
+            msg = ""
+            if forced_fallback:
+                msg += "⚠️ **[VISUAL ENGINE FAIL]** Displaying text backup.\n\n"
+
+            msg += f"> **{movie_quote}**\n\n**{raw_ticker} VOLATILITY REPORT ({engine})**\n\n`{'RANGE':<12} | {'VALUE':<12} | {'MOVE':<12} | {'TYPE':<12}\n" + "-"*56 + "\n"
             msg += f"{'IV':<12} | {data['iv']:<12.4f} | {levels['meta']['daily_move_iv']:<12.2f} | {'Implied'}\n{'HV':<12} | {data['hv']:<12.4f} | {levels['meta']['daily_move_hv']:<12.2f} | {'Historical'}\n`\n\n**{raw_ticker} LEVELS**\n`{'LEVEL':<12} | {'VALENTINE':<15} | {'WINTHORPE':<15}\n" + "-"*48 + "\n"
             for i in range(4, 0, -1): msg += f"+{i}σ           | {levels['valentine'][f'+{i}σ']:<15.2f} | {levels['winthorpe'][f'+{i}σ']:<15.2f}\n" 
             msg += f"{anchor_label:<12} | {display_price:.2f}\n" 
@@ -1345,75 +1351,66 @@ async def daily_levels(
             
     except Exception as e:
         await ctx.interaction.edit_original_response(content=f"⚠️ **Beeks:** 'Level Mapping Failed: {e}'")
-@beeks.command(name="chain", description="View Raw Chain")
-async def beeks_chain(
+
+@dom_group.command(name="chain", description="View Raw Option Chain Data")
+async def dom_chain(
     ctx: discord.ApplicationContext, 
     ticker: Option(str, required=True), 
-    scope: Option(str, choices=["0DTE", "Front Month", "Total Market"], default="0DTE"), 
-    expiry: Option(str, description="Target Specific Date (Format: YYYY-MM-DD)", required=False), # <--- FIXED
-    center: Option(float, required=False), 
-    rows: Option(int, choices=[1, 3, 5, 10], default=10), 
-    replay_date: Option(str, description="Historical Snapshot (Select from list)", autocomplete=get_db_dates, required=False), # <--- FIXED
+    target_expiry: Option(str, description="Target Event (Format: YYYY-MM-DD)", required=False),
+    replay_date: Option(str, description="Historical Snapshot (Select from list)", autocomplete=get_db_dates, required=False),
     session: Option(str, autocomplete=get_db_tags, required=False)
 ):
     await ctx.defer(ephemeral=True)
-    yf_sym = resolve_yf_symbol(ticker); display_ticker = get_options_ticker(yf_sym); actual_rows = 11 if rows == 10 else rows
-    calc_date = replay_date if replay_date else None; calc_tag = session; 
-    if calc_date and not calc_tag: calc_tag = get_latest_tag_for_date(display_ticker, calc_date)
-    
-    # PASS SCOPE TO ENGINE
-    data = fetch_and_enrich_chain(
-        ticker=ticker, 
-        expiry_date=expiry, 
-        snapshot_date=calc_date, 
-        snapshot_tag=calc_tag, 
-        scope=scope, # <--- User Selection
-        range_count=actual_rows, 
-        pivot=center
-    )
-    
-    if not data: await ctx.respond(f"❌ **Beeks:** 'Live Data Feed Is Currently Dark. Can you Try a Replay Date?'", ephemeral=True); return
-    
-    spot = data[0]['spot']; target_date = expiry if expiry else scope; view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES); source_label = f"DB: {calc_date} [{calc_tag}]" if calc_date else "LIVE"
-    closest_strike = min([d['strike'] for d in data], key=lambda x: abs(x - spot))
-    
-    table_rows = []; grouped = {}
-    for row in data:
-        k = row['strike']
-        if k not in grouped: grouped[k] = {'C': None, 'P': None}
-        if row['type'].lower().startswith('c'): grouped[k]['C'] = row
-        else: grouped[k]['P'] = row
-    sorted_strikes = sorted(grouped.keys(), reverse=True)
-    for k in sorted_strikes:
-        c = grouped[k]['C']; p = grouped[k]['P']
-        c_iv = c.get('iv', 0) if c else 0; c_delta = c.get('delta', 0) if c else 0; c_gamma = c.get('gamma', 0) if c else 0; c_theta = c.get('theta', 0) if c else 0; c_vol = c.get('volume', 0) if c else 0; c_oi = c.get('oi', 0) if c else 0
-        p_iv = p.get('iv', 0) if p else 0; p_delta = p.get('delta', 0) if p else 0; p_gamma = p.get('gamma', 0) if p else 0; p_theta = p.get('theta', 0) if p else 0; p_vol = p.get('volume', 0) if p else 0; p_oi = p.get('oi', 0) if p else 0
-        table_rows.append({'strike': k, 'c_iv': c_iv, 'c_delta': c_delta, 'c_gamma': c_gamma, 'c_theta': c_theta, 'c_vol': c_vol, 'c_oi': c_oi, 'p_iv': p_iv, 'p_delta': p_delta, 'p_gamma': p_gamma, 'p_theta': p_theta, 'p_vol': p_vol, 'p_oi': p_oi})
-    
-    if view_setting == 'modern':
-        plt.figure(figsize=(16, len(table_rows) * 0.5 + 3)); plt.style.use('dark_background'); ax = plt.gca(); ax.axis('off')
-        cols = ['VOL', 'OI', 'IV', 'THETA', 'GAMMA', 'DELTA', 'STRIKE', 'DELTA', 'GAMMA', 'THETA', 'IV', 'OI', 'VOL']; cell_text = []; cell_colors = []
-        for row in table_rows:
-            c_bg = '#003300' if row['strike'] < spot else '#222222'; p_bg = '#330000' if row['strike'] > spot else '#222222'; s_bg = '#AA8800' if row['strike'] == closest_strike else '#444444' 
-            r_colors = [c_bg]*6 + [s_bg] + [p_bg]*6
-            r_data = [f"{int(row['c_vol'])}", f"{int(row['c_oi'])}", f"{row['c_iv']:.1%}", f"{row['c_theta']:.2f}", f"{row['c_gamma']:.3f}", f"{row['c_delta']:.2f}", f"{row['strike']:.0f}", f"{row['p_delta']:.2f}", f"{row['p_gamma']:.3f}", f"{row['p_theta']:.2f}", f"{row['p_iv']:.1%}", f"{int(row['p_oi'])}", f"{int(row['p_vol'])}"]
-            cell_text.append(r_data); cell_colors.append(r_colors)
-        table = plt.table(cellText=cell_text, colLabels=cols, cellColours=cell_colors, loc='center', cellLoc='center')
-        table.auto_set_font_size(False); table.set_fontsize(9); table.scale(1, 1.8) 
-        for (i, j), cell in table.get_celld().items():
-            if i == 0: cell.set_text_props(weight='bold', color='white'); cell.set_facecolor('#111111'); cell.set_edgecolor('white'); cell.set_linewidth(1)
-            else: cell.set_edgecolor('#555555'); cell.set_linewidth(0.5)
-        plt.title(f"{display_ticker} CHAIN  |  EXPIRY: {target_date}  |  SPOT: {spot:.2f}\nFEED: {source_label}", color='white', pad=20, fontsize=14, weight='bold')
-        buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e', dpi=120); buf.seek(0); plt.close()
-        file = discord.File(buf, filename="beeks_chain.png"); embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_chain.png"); await ctx.respond(embed=embed, file=file, ephemeral=True)
-    else:
-        def fmt_5(val): s = f"{int(val)/1000:.0f}k" if int(val) >= 1000 else str(int(val)); return f"{s:>5}"
-        lines = [f"> **{quote}**", f"```yaml", f"TICKER: {display_ticker}  SPOT: {spot:.2f}", f"EXP: {target_date}  SRC: {source_label}", f"-"*74, f"|{'CALLS':^32}|{'':^6}|{'PUTS':^32}|", f"|{'V':>5}{'OI':>5}{'IV':>4}{'TH':>6}{'GM':>6}{'DL':>6}|{'STRK':^6}|{'DL':>6}{'GM':>6}{'TH':>6}{'IV':>4}{'OI':>5}{'V':>5}|", f"-"*74]
-        for row in table_rows:
-            s_str = f"{row['strike']:.0f}"; strike_display = f">{s_str}<" if row['strike'] == closest_strike else s_str
-            line = (f"|{fmt_5(row['c_vol'])}{fmt_5(row['c_oi'])}{row['c_iv']:>4.0%}{row['c_theta']:>6.2f}{row['c_gamma']:>6.3f}{row['c_delta']:>6.2f}|{strike_display:^6}|{row['p_delta']:>6.2f}{row['p_gamma']:>6.3f}{row['p_theta']:>6.2f}{row['p_iv']:>4.0%}{fmt_5(row['p_oi'])}{fmt_5(row['p_vol'])}|")
-            lines.append(line)
-        lines.append(f"-"*74); lines.append(f"```"); final_text = "\n".join(lines); await ctx.respond(final_text[:1950] + ("\n..." if len(final_text)>1950 else ""), ephemeral=True)
+    try: # <--- SAFETY WRAPPER START
+        scope_label = "0DTE" if not target_expiry else f"EXP: {target_expiry}"
+        
+        # Fetch Data
+        data = fetch_and_enrich_chain(ticker, target_expiry, replay_date, session, scope="0DTE")
+        
+        # FIX: Check for empty data to prevent crash
+        if not data: 
+            await ctx.respond("❌ **Beeks:** 'Chain is dark. No data found.'", ephemeral=True)
+            return
+
+        spot = data[0]['spot']
+        # Sort by strike to make the list readable
+        data.sort(key=lambda x: x['strike'])
+        
+        # Find the index of the strike closest to spot
+        closest_idx = min(range(len(data)), key=lambda i: abs(data[i]['strike'] - spot))
+        
+        # Slice: Show 5 strikes above and 5 below ATM (10 total rows approx)
+        start_idx = max(0, closest_idx - 5)
+        end_idx = min(len(data), closest_idx + 6)
+        subset = data[start_idx:end_idx]
+
+        quote = random.choice(MOVIE_QUOTES)
+        display_ticker = get_options_ticker(ticker)
+
+        msg = f"> **{quote}**\n```yaml\n"
+        msg += f"[{display_ticker} CHAIN SNAPSHOT]\n"
+        msg += f"SCOPE : {scope_label}\n"
+        msg += f"SPOT  : {spot:.2f}\n"
+        msg += "-" * 65 + "\n"
+        msg += f"|{'STRIKE':^8}|{'TYPE':^4}|{'BID':^6}|{'ASK':^6}|{'VOL':^6}|{'OI':^6}|{'GEX':^8}|\n"
+        msg += "-" * 65 + "\n"
+
+        for row in subset:
+            # Highlight ATM row
+            prefix = ">" if row == data[closest_idx] else " "
+            
+            # formatting helpers
+            typ = "C" if row['type'] == 'Call' else "P"
+            gex_short = f"{int(row['gex']/1000)}k" if abs(row['gex']) < 1000000 else f"{row['gex']/1000000:.1f}M"
+            
+            line = f"{prefix}|{row['strike']:<8.1f}|{typ:^4}|{row['bid']:>6.2f}|{row['ask']:>6.2f}|{row['volume']:>6}|{row['oi']:>6}|{gex_short:>8}|"
+            msg += line + "\n"
+            
+        msg += "```"
+        await ctx.respond(msg, ephemeral=True)
+
+    except Exception as e:
+        await ctx.respond(f"⚠️ **Beeks:** 'Chain retrieval failed: {e}'", ephemeral=True)
 
 # --- DOM SUITE ---
 dom_group = beeks.create_subgroup("dom", "Dealer Open Market (Structure & Positioning)")

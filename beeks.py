@@ -1782,32 +1782,42 @@ async def dom_pcr(
     session: Option(str, autocomplete=get_db_tags, required=False)
 ):
     await ctx.defer(ephemeral=True)
-    try: # <--- SAFETY WRAPPER START
+    try: 
         scope_label = "0DTE" if not target_expiry else f"EXP: {target_expiry}"
         data = fetch_and_enrich_chain(ticker, target_expiry, replay_date, session, scope="0DTE")
         
-        # FIX: Explicit check for None or Empty data
         if not data: 
             await ctx.respond("❌ **Beeks:** 'Data Dark.'", ephemeral=True)
             return
         
         spot = data[0]['spot']
+        
+        # Calculate Sums (These might result in NaN if underlying data is dirty)
         c_vol = sum(x['volume'] for x in data if x['type'] == 'Call')
         p_vol = sum(x['volume'] for x in data if x['type'] == 'Put')
         c_oi = sum(x['oi'] for x in data if x['type'] == 'Call')
         p_oi = sum(x['oi'] for x in data if x['type'] == 'Put')
         
+        # Helper variables
+        vol_total = c_vol + p_vol
+        oi_total = c_oi + p_oi
+
+        # Ratios (Handle division by zero)
         vol_pcr = p_vol / c_vol if c_vol > 0 else 0
         oi_pcr = p_oi / c_oi if c_oi > 0 else 0
         
-        # FIX: Use helper and handle None
         max_pain = calculate_max_pain(data)
-
-        if max_pain is not None and pd.isna(max_pain):
-            max_pain = None
         
-        # NOTE: For the image generator, we pass 0 if None to prevent a crash in 'int()'.
-        # To see "N/A" on the image, we must update 'generate_pcr_dashboard' next.
+        # --- SANITIZATION BLOCK (THE FIX) ---
+        # Force convert any NaN to 0.0 to prevent crashes in int() later
+        if pd.isna(c_vol): c_vol = 0.0
+        if pd.isna(p_vol): p_vol = 0.0
+        if pd.isna(c_oi): c_oi = 0.0
+        if pd.isna(p_oi): p_oi = 0.0
+        if pd.isna(vol_total): vol_total = 0.0
+        if max_pain is not None and pd.isna(max_pain): max_pain = None
+        # ------------------------------------
+
         mp_display = max_pain if max_pain is not None else 0
         
         view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
@@ -1815,12 +1825,12 @@ async def dom_pcr(
 
         if view_setting == 'modern':
             vol_data = {'calls': c_vol, 'puts': p_vol}; oi_data = {'calls': c_oi, 'puts': p_oi}
-            img_buf = generate_pcr_dashboard(display_ticker, spot, vol_pcr, oi_pcr, vol_data, oi_data, scope_label, target_expiry, mp_display, c_vol+p_vol)
+            # Pass sanitized vol_total instead of calculating inline
+            img_buf = generate_pcr_dashboard(display_ticker, spot, vol_pcr, oi_pcr, vol_data, oi_data, scope_label, target_expiry, mp_display, vol_total)
             file = discord.File(img_buf, filename="beeks_pcr.png")
             embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_pcr.png")
             await ctx.respond(embed=embed, file=file, ephemeral=True)
         else:
-            # BLOOMBERG VIEW (Enhanced)
             msg = f"> **{quote}**\n```yaml\n"
             msg += f"[{display_ticker} FLOW ANALYSIS]\n"
             msg += f"SCOPE  : {scope_label}\n"
@@ -1829,7 +1839,6 @@ async def dom_pcr(
             msg += f"VOL PCR: {vol_pcr:.2f} ({'BEARISH' if vol_pcr > 1 else 'BULLISH'})\n"
             msg += f"OI PCR : {oi_pcr:.2f}\n"
             
-            # Use N/A for text mode since we control the string here
             mp_str = f"{max_pain:.0f}" if max_pain is not None else "N/A"
             msg += f"MAX PN : {mp_str}\n"
             
@@ -1838,7 +1847,6 @@ async def dom_pcr(
 
     except Exception as e:
         await ctx.respond(f"⚠️ **Beeks:** 'PCR Calculation Failed: {e}'", ephemeral=True)
-
 @dom_group.command(name="vrp", description="Volatility Risk Premium (Edge Meter)")
 async def dom_vrp(
     ctx: discord.ApplicationContext, 

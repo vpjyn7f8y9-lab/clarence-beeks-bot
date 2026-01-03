@@ -21,6 +21,7 @@ import json
 import time
 import scipy.stats as si
 import pytz
+import requests
 from matplotlib.patches import Rectangle, Patch
 
 # --- CONFIGURATION ---

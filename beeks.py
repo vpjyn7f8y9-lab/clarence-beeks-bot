@@ -1203,8 +1203,8 @@ async def beeks_dailyrange(
         await ctx.respond(msg, ephemeral=True)
     else: 
         buf = create_beeks_chart(raw_ticker, chart_data, levels, engine)
-        file = discord.File(buf, filename="beeks_report.png")
-        embed = discord.Embed(description=f"**{movie_quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_report.png"); embed.set_footer(text=clean_footer)
+        file = discord.File(buf, filename="beeks_dailyrange.png")
+        embed = discord.Embed(description=f"**{movie_quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_dailyrange.png"); embed.set_footer(text=clean_footer)
         await ctx.respond(embed=embed, file=file, ephemeral=True)
 
 @beeks.command(name="dailylevels", description="Key Dealer GEX Levels & Volatility")
@@ -1254,9 +1254,9 @@ async def daily_levels(
     # VISUALIZATION
     if view_setting == 'modern':
         img_buf = generate_strike_chart(display_ticker, spot_price, strike_data, metric, confluence_map)
-        file = discord.File(img_buf, filename="strikes.png")
+        file = discord.File(img_buf, filename="beeks_strikes.png")
         desc = f"**{quote}**\n" + (f"\n**🎯 CONFLUENCE (Top 5)**\n" + "\n".join([f"`{int(i['strike']):<5}` {'⭐'*i['score']} ({i['tags']})" for i in confluence_map[:5]]) if metric == "CONFLUENCE" else "")
-        embed = discord.Embed(color=0x2b2d31, description=desc); embed.set_image(url="attachment://strikes.png"); embed.set_footer(text=f"Spot: {spot_price:.2f} | {scope}")
+        embed = discord.Embed(color=0x2b2d31, description=desc); embed.set_image(url="attachment://beeks_strikes.png"); embed.set_footer(text=f"Spot: {spot_price:.2f} | {scope}")
         await ctx.interaction.edit_original_response(content="", embed=embed, file=file)
     else:
         # Text Mode
@@ -1357,7 +1357,7 @@ async def beeks_chain(
             else: cell.set_edgecolor('#555555'); cell.set_linewidth(0.5)
         plt.title(f"{display_ticker} CHAIN  |  EXPIRY: {target_date}  |  SPOT: {spot:.2f}\nFEED: {source_label}", color='white', pad=20, fontsize=14, weight='bold')
         buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e', dpi=120); buf.seek(0); plt.close()
-        file = discord.File(buf, filename="chain_modern.png"); embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://chain_modern.png"); await ctx.respond(embed=embed, file=file, ephemeral=True)
+        file = discord.File(buf, filename="beeks_chain.png"); embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_chain.png"); await ctx.respond(embed=embed, file=file, ephemeral=True)
     else:
         def fmt_5(val): s = f"{int(val)/1000:.0f}k" if int(val) >= 1000 else str(int(val)); return f"{s:>5}"
         lines = [f"> **{quote}**", f"```yaml", f"TICKER: {display_ticker}  SPOT: {spot:.2f}", f"EXP: {target_date}  SRC: {source_label}", f"-"*74, f"|{'CALLS':^32}|{'':^6}|{'PUTS':^32}|", f"|{'V':>5}{'OI':>5}{'IV':>4}{'TH':>6}{'GM':>6}{'DL':>6}|{'STRK':^6}|{'DL':>6}{'GM':>6}{'TH':>6}{'IV':>4}{'OI':>5}{'V':>5}|", f"-"*74]
@@ -1450,7 +1450,7 @@ async def dom_report(
         # If you want VRP visual, we should merge it into the main dashboard later. 
         # For now, text representation is cleaner.
 
-        file_exp = discord.File(img_exp, filename="exposures.png")
+        file_exp = discord.File(img_exp, filename="beeks_exposures.png")
         
         # Executive Summary Embed
         embed = discord.Embed(title=f"🍊 THE BEEKS REPORT: {display_ticker}", description=f"**\"{quote}\"**", color=0x2b2d31)
@@ -1468,7 +1468,7 @@ async def dom_report(
         embed.add_field(name="📊 PCR (0DTE)", value=f"**{vol_pcr:.2f}**\n(Vol Ratio)", inline=True)
         embed.add_field(name="📌 PAIN (0DTE)", value=f"**{max_pain:.0f}**\n(Max Pain)", inline=True)
 
-        embed.set_image(url="attachment://exposures.png")
+        embed.set_image(url="attachment://beeks_exposures.png")
         # NO THUMBNAIL SET HERE
         
         await ctx.interaction.edit_original_response(content="", embed=embed, file=file_exp)
@@ -1533,7 +1533,7 @@ async def dom_exposures(
 
     if view_setting == 'modern':
         img_buf = generate_exposure_dashboard(display_ticker, spot_price, gex, dex, vex, label, None)
-        file = discord.File(img_buf, filename="exposures.png"); embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://exposures.png"); await ctx.respond(embed=embed, file=file, ephemeral=True)
+        file = discord.File(img_buf, filename="beeks_exposures.png"); embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_exposures.png"); await ctx.respond(embed=embed, file=file, ephemeral=True)
     else:
         def fmt(v, s="B"): d=1_000_000_000 if s=="B" else 1_000_000; return f"${v/d:>7.2f} {s}"
         msg = f"> **{quote}**\n```yaml\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| CLARENCE BEEKS TERMINAL           [EXPOSURE]     |\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| TICKER: {display_ticker:<16} SPOT: {spot_price:<15.2f} |\n"; msg += f"| SCOPE:  {label:<32} |\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| DEX (DELTA)   : {fmt(dex, 'B'):<12} Net Notional   |\n"; msg += f"| GEX (GAMMA)   : {fmt(gex, 'B'):<12} / 1% Move      |\n"; msg += f"| VEX (VANNA)   : {fmt(vex, 'M'):<12} / 1% IV Change |\n"; msg += f"+--------------------------------------------------+\n"; msg += f"| REGIME: {'DAMPENED VOL (Stable)' if gex > 0 else 'ACCELERATED VOL (Unstable)':<32} |\n"; msg += f"+--------------------------------------------------+\n```"; await ctx.respond(msg, ephemeral=True)
@@ -1574,8 +1574,8 @@ async def dom_flip(
     if view_setting == 'modern' and sim_data:
         # IMAGE VIEW
         img_buf = generate_flip_chart(display_ticker, spot, flip_level, sim_data[0], sim_data[1], scope_label)
-        file = discord.File(img_buf, filename="flip.png")
-        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://flip.png")
+        file = discord.File(img_buf, filename="beeks_flip.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_flip.png")
         await ctx.respond(embed=embed, file=file, ephemeral=True)
     else:
         # BLOOMBERG VIEW (Enhanced)
@@ -1620,8 +1620,8 @@ async def dom_vig(
     if view_setting == 'modern':
         # IMAGE VIEW
         img_buf = generate_vig_chart(display_ticker, spot, vig, upper, lower, scope_label)
-        file = discord.File(img_buf, filename="vig.png")
-        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://vig.png")
+        file = discord.File(img_buf, filename="beeks_vig.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_vig.png")
         await ctx.respond(embed=embed, file=file, ephemeral=True)
     else:
         # BLOOMBERG VIEW (Enhanced)
@@ -1666,8 +1666,8 @@ async def dom_skew(
     if view_setting == 'modern':
         # IMAGE VIEW
         img_buf = generate_skew_chart(display_ticker, spot, c_25['iv'], p_25['iv'], ratio, scope_label)
-        file = discord.File(img_buf, filename="skew.png")
-        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://skew.png")
+        file = discord.File(img_buf, filename="beeks_skew.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_skew.png")
         await ctx.respond(embed=embed, file=file, ephemeral=True)
     else:
         # BLOOMBERG VIEW (Enhanced)
@@ -1722,8 +1722,8 @@ async def dom_pcr(
         # IMAGE VIEW (Uses the existing generate_pcr_dashboard)
         vol_data = {'calls': c_vol, 'puts': p_vol}; oi_data = {'calls': c_oi, 'puts': p_oi}
         img_buf = generate_pcr_dashboard(display_ticker, spot, vol_pcr, oi_pcr, vol_data, oi_data, scope_label, target_expiry, max_pain, c_vol+p_vol)
-        file = discord.File(img_buf, filename="pcr.png")
-        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://pcr.png")
+        file = discord.File(img_buf, filename="beeks_pcr.png")
+        embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31); embed.set_image(url="attachment://beeks_pcr.png")
         await ctx.respond(embed=embed, file=file, ephemeral=True)
     else:
         # BLOOMBERG VIEW (Enhanced)
@@ -1772,9 +1772,9 @@ async def dom_vrp(
     
     if view_setting == 'modern':
         img_buf = generate_vrp_gauge(ticker.upper(), iv, hv, spread, ratio)
-        file = discord.File(img_buf, filename="vrp.png")
+        file = discord.File(img_buf, filename="beeks_vrp.png")
         embed = discord.Embed(description=f"**{quote}**", color=0x2b2d31)
-        embed.set_image(url="attachment://vrp.png")
+        embed.set_image(url="attachment://beeks_vrp.png")
         await ctx.respond(embed=embed, file=file, ephemeral=True)
     else:
         # Bloomberg View
@@ -1926,7 +1926,22 @@ async def before_scheduler(): await bot.wait_until_ready(); print("⏰ Scheduler
 async def scheduler_error(error): print(f"💀 SCHEDULER CRASHED: {error}"); auto_fetch_heavy_chains.restart()
 
 @bot.event
-async def on_ready(): init_db(); (auto_fetch_heavy_chains.start() if not auto_fetch_heavy_chains.is_running() else None); print(f"🍊 Duke & Duke: Clarence Beeks is Online. Logged in as {bot.user}"); await bot.sync_commands()
+async def on_ready():
+    init_db()
+    
+    # --- PROXY CHECK ---
+    try:
+        ip_resp = requests.get("https://httpbin.org/ip", timeout=5).json()
+        print(f"🔒 PROXY CHECK: Bot is surfing as {ip_resp['origin']}")
+    except:
+        print("⚠️ PROXY CHECK FAILED: Could not reach external IP.")
+    # -------------------
+
+    if not auto_fetch_heavy_chains.is_running():
+        auto_fetch_heavy_chains.start()
+    
+    print(f"🍊 Duke & Duke: Clarence Beeks is Online. Logged in as {bot.user}")
+    await bot.sync_commands()
 
 if TOKEN: bot.run(TOKEN)
 else: bot.run("YOUR_TOKEN_HERE")

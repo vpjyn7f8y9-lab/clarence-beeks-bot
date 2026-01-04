@@ -895,28 +895,31 @@ def generate_flip_chart(ticker, spot, flip_level, sim_spots, net_gammas, scope_l
 def generate_vig_chart(ticker, spot, vig, upper, lower, scope_label):
     plt.figure(figsize=(10, 4)); plt.style.use('dark_background')
     fig, ax = plt.subplots(figsize=(10, 4)); fig.patch.set_facecolor('#1e1e1e'); ax.set_facecolor('#1e1e1e')
-    ax.get_yaxis().set_visible(False)
     
-    # Draw Range Line
+    # Lock Y-Axis to keep everything tight
+    ax.set_ylim(-0.15, 0.15)
+    ax.set_xlim(min(lower, spot)*0.999, max(upper, spot)*1.001) # Add slight breathing room to X
+    
+    # Draw Range Line (Center at y=0)
     plt.plot([lower, upper], [0, 0], color='#444444', linewidth=4, zorder=1)
     
-    # Draw Breakeven Markers
+    # Draw Breakeven Markers & Text (Slightly Above y=0)
     plt.scatter([lower, upper], [0, 0], color='cyan', s=200, zorder=2, label='Breakevens')
-    plt.text(lower, 0.1, f"{lower:.2f}", color='cyan', ha='center', weight='bold')
-    plt.text(upper, 0.1, f"{upper:.2f}", color='cyan', ha='center', weight='bold')
+    plt.text(lower, 0.03, f"{lower:.2f}", color='cyan', ha='center', weight='bold', fontsize=12)
+    plt.text(upper, 0.03, f"{upper:.2f}", color='cyan', ha='center', weight='bold', fontsize=12)
     
-    # Draw Spot Marker
+    # Draw Spot Marker & Text (Slightly Below y=0)
     plt.scatter([spot], [0], color='yellow', s=300, marker='|', linewidth=4, zorder=3, label='Spot')
-    plt.text(spot, -0.15, f"SPOT\n{spot:.2f}", color='yellow', ha='center', weight='bold')
+    plt.text(spot, -0.05, f"SPOT\n{spot:.2f}", color='yellow', ha='center', weight='bold', fontsize=12)
 
-    ax.set_title(f"{ticker} INTRADAY EXPECTED MOVE (VIG)", color='white', weight='bold', pad=20)
+    ax.set_title(f"{ticker} INTRADAY EXPECTED MOVE (VIG)", color='white', weight='bold', pad=10)
     
     # Footer
-    plt.figtext(0.5, 0.05, f"SCOPE: {scope_label} | COST: ${vig:.2f}", ha="center", color="gray", fontsize=10)
+    plt.figtext(0.5, 0.02, f"SCOPE: {scope_label} | COST: ${vig:.2f}", ha="center", color="gray", fontsize=10)
     
-    # Remove spines
+    # Remove spines and ticks
     for spine in ax.spines.values(): spine.set_visible(False)
-    ax.set_xticks([])
+    ax.set_xticks([]); ax.set_yticks([])
 
     buf = io.BytesIO(); plt.savefig(buf, format='png', bbox_inches='tight', facecolor='#1e1e1e'); buf.seek(0); plt.close()
     return buf
@@ -1485,19 +1488,20 @@ async def dom_report(
             c_oi = sum(x['oi'] for x in data_0dte if x['type'] == 'Call')
             p_oi = sum(x['oi'] for x in data_0dte if x['type'] == 'Put')
             
-            # Sanitization
             if pd.isna(c_oi): c_oi = 0.0
             if pd.isna(p_oi): p_oi = 0.0
             
             oi_pcr = p_oi / c_oi if c_oi > 0 else 0
             
             max_pain = calculate_max_pain(data_0dte)
-            # Sanitization for Max Pain
             if max_pain is not None and pd.isna(max_pain): max_pain = None
 
-        # F. VRP
-        vrp_spread = 0.0
-        if vrp_data: vrp_spread = (vrp_data['iv'] - vrp_data['hv']) * 100
+        # F. VRP (Updated to include IV/HV)
+        vrp_spread = 0.0; iv_disp = 0.0; hv_disp = 0.0
+        if vrp_data: 
+            vrp_spread = (vrp_data['iv'] - vrp_data['hv']) * 100
+            iv_disp = vrp_data['iv'] * 100
+            hv_disp = vrp_data['hv'] * 100
 
         # 4. REPORT GENERATION
         view_setting = get_user_terminal_setting(ctx.author.id); quote = random.choice(MOVIE_QUOTES)
@@ -1516,11 +1520,12 @@ async def dom_report(
             # ROW 1: Structure (Flip / Skew / VRP)
             embed.add_field(name="🔄 FLIP (Front)", value=f"**{flip_price:.2f}**\n{flip_status}" if flip_price else "**N/A**", inline=True)
             embed.add_field(name="⚖️ SKEW (Front)", value=f"**{skew_ratio:.2f}x**\n{skew_status}", inline=True)
-            embed.add_field(name="📉 VALUE (VRP)", value=f"**{vrp_spread:+.2f}%**\n{'SELL' if vrp_spread>0 else 'BUY'}", inline=True)
+            
+            # UPDATED VRP FIELD
+            embed.add_field(name="📉 VALUE (VRP)", value=f"**{vrp_spread:+.2f}%**\nIV:{iv_disp:.1f}% | HV:{hv_disp:.1f}%", inline=True)
             
             # ROW 2: Intraday (Vig / PCR / Pain)
             embed.add_field(name="💰 VIG (0DTE)", value=f"**${vig_val:.2f}**\n{vig_lower:.0f}-{vig_upper:.0f}", inline=True)
-            # CHANGED TO OI PCR HERE vvv
             embed.add_field(name="📊 PCR (0DTE)", value=f"**{oi_pcr:.2f}**\n(Open Interest)", inline=True)
             
             mp_display = f"{max_pain:.0f}" if max_pain is not None else "N/A"
@@ -1531,7 +1536,7 @@ async def dom_report(
             await ctx.interaction.edit_original_response(content="", embed=embed, file=file_exp)
 
         else:
-            # BLOOMBERG TEXT MODE (Unchanged)
+            # BLOOMBERG TEXT MODE (Updated)
             lines = [f"> **{quote}**", "```yaml", f"CLARENCE BEEKS EXECUTIVE REPORT: {display_ticker}", "="*45]
             lines.append(f"SPOT: {spot:.2f}   |   {datetime.datetime.now().strftime('%H:%M')} ET")
             lines.append("-" * 45)
@@ -1544,19 +1549,17 @@ async def dom_report(
             lines.append("-" * 45)
             lines.append(f"3. INTRADAY (0DTE)")
             lines.append(f"   Vig (Cost): ${vig_val:.2f} [{vig_lower:.0f}-{vig_upper:.0f}]")
-            # CHANGED TO OI PCR HERE vvv
             lines.append(f"   OI PCR:     {oi_pcr:.2f}")
-            
             mp_display = f"{max_pain:.0f}" if max_pain is not None else "N/A"
             lines.append(f"   Max Pain:   {mp_display}")
             lines.append("-" * 45)
             lines.append(f"4. VALUE (VRP)")
-            lines.append(f"   Premium:    {vrp_spread:+.2f}% ({'SELL' if vrp_spread>0 else 'BUY'})")
+            lines.append(f"   Spread:     {vrp_spread:+.2f}% ({'SELL' if vrp_spread>0 else 'BUY'})")
+            lines.append(f"   Detail:     IV: {iv_disp:.1f}% | HV: {hv_disp:.1f}%")
             lines.append("```")
             await ctx.interaction.edit_original_response(content="\n".join(lines))
     
     except Exception as e:
-        # SAFETY WRAPPER END
         await ctx.interaction.edit_original_response(content=f"⚠️ **Beeks:** 'Report compilation failed: {e}'")
 
 @dom_group.command(name="exposures", description="Total Dealer Exposure (GEX/DEX/VEX)")
